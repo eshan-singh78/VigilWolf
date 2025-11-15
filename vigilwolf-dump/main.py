@@ -6,7 +6,7 @@ from func.regexsearchfunc import regex_search
 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
 
-subprocess.run(["bash", "./nrd-fix.sh"], capture_output=True, text=True)
+subprocess.run(["bash", "./nrd-fix-portable.sh"], capture_output=True, text=True)
 print("Download Successful")
 
 search_pattern = input("Enter the search string: ")
