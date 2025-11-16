@@ -3,3 +3,46 @@ URL="https://www.whoisds.com//whois-database/newly-registered-domains/MjAyNS0xMS
 FILENAME="${URL##*/}.zip"
 
 curl -L "$URL" -o "$FILENAME"
+
+
+
+
+
+
+https://www.virustotal.com/ui/search?limit=2&relationships%5Bcomment%5D=author%2Citem&query=http%3A%2F%2Feshansingh.me
+
+
+curl 'https://www.virustotal.com/ui/search?limit=2&relationships%5Bcomment%5D=author%2Citem&query=http%3A%2F%2Feshansingh.me' \
+  -H 'accept: application/json' \
+  -H 'accept-ianguage: en-US,en;q=0.9,es;q=0.8' \
+  -H 'accept-language: en-GB,en;q=0.6' \
+  -H 'content-type: application/json' \
+  -H 'priority: u=1, i' \
+  -H 'referer: https://www.virustotal.com/' \
+  -H 'sec-ch-ua: "Chromium";v="142", "Brave";v="142", "Not_A Brand";v="99"' \
+  -H 'sec-ch-ua-mobile: ?1' \
+  -H 'sec-ch-ua-platform: "Android"' \
+  -H 'sec-fetch-dest: empty' \
+  -H 'sec-fetch-mode: cors' \
+  -H 'sec-fetch-site: same-origin' \
+  -H 'sec-gpc: 1' \
+  -H 'user-agent: Mozilla/5.0 (Linux; Android 6.0; Nexus 5 Build/MRA58N) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Mobile Safari/537.36' \
+  -H 'x-app-version: v1x496x0' \
+  -H 'x-tool: vt-ui-main' \
+  -H 'x-vt-anti-abuse-header: MTEzOTk5Mjg4MTQtWkc5dWRDQmlaU0JsZG1scy0xNzYzMzEwNTA5Ljc0Nw=='
+
+
+
+
+  curl 'https://www.virustotal.com/ui/urls/e2e43c50ed187b3adc68bf141c064c29dffc98e1b0647e2daaf20ca5862aeeea/network_location' \
+  -H 'Accept-Ianguage: en-US,en;q=0.9,es;q=0.8' \
+  -H 'sec-ch-ua-platform: "Android"' \
+  -H 'Referer: https://www.virustotal.com/' \
+  -H 'sec-ch-ua: "Chromium";v="142", "Brave";v="142", "Not_A Brand";v="99"' \
+  -H 'X-VT-Anti-Abuse-Header: MTI2NDAyNTI2NjctWkc5dWRDQmlaU0JsZG1scy0xNzYzMzEwNjgyLjMwMg==' \
+  -H 'sec-ch-ua-mobile: ?1' \
+  -H 'X-Tool: vt-ui-main' \
+  -H 'x-app-version: v1x496x0' \
+  -H 'User-Agent: Mozilla/5.0 (Linux; Android 6.0; Nexus 5 Build/MRA58N) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Mobile Safari/537.36' \
+  -H 'accept: application/json' \
+  -H 'Content-Type: application/json'

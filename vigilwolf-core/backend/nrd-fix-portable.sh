@@ -16,7 +16,7 @@ echo "Using temp folder: $TEMP_DIR"
 # ---------------------------
 # Number of days to fetch
 # ---------------------------
-DAY_RANGE=30
+DAY_RANGE=7
 
 # ---------------------------
 # File to merge all domains
