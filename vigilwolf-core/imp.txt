@@ -1,0 +1,5 @@
+URL="https://www.whoisds.com//whois-database/newly-registered-domains/MjAyNS0xMS0xNi56aXA=/nrd"
+
+FILENAME="${URL##*/}.zip"
+
+curl -L "$URL" -o "$FILENAME"
