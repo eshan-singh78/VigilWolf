@@ -1,2 +1,2 @@
 fuzzysearch
-FastAPI
+fastapi
