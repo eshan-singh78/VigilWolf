@@ -1,13 +1,14 @@
 from difflib import SequenceMatcher
 import re
+from typing import Optional, Dict, Any
 
 from .fuzzsearchfunc import fuzzy_search_with_score
 from .regexsearchfunc import regex_search_with_info
 
 
-def brand_search(brand: str, filepath: str) -> list:
+def brand_search(brand: str, filepath: str, limit: Optional[int] = None, offset: int = 0) -> Dict[str, Any]:
     if not brand or not isinstance(brand, str):
-        return []
+        return {"results": [], "total": 0}
 
     fuzzy_results = fuzzy_search_with_score(brand, filepath)
     regex_results = regex_search_with_info(re.escape(brand), filepath)
@@ -29,4 +30,10 @@ def brand_search(brand: str, filepath: str) -> list:
 
     results.sort(key=lambda r: (r['fuzzyScore'], r['regexHit']), reverse=True)
 
-    return results
+    total = len(results)
+    if limit is None:
+        sliced = results[offset:]
+    else:
+        sliced = results[offset: offset + limit]
+
+    return {"results": sliced, "total": total}

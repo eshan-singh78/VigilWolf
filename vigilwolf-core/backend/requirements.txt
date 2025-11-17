@@ -1,2 +1,3 @@
 fuzzysearch
 fastapi
+python-whois

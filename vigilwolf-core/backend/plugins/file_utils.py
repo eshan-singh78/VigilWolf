@@ -43,10 +43,31 @@ def read_domains_from_file(filepath: str) -> list:
         return []
 
 
-def get_latest_nrd_domains() -> tuple:
+def read_domains_from_file_slice(filepath: str, offset: int = 0, limit: int | None = None) -> tuple:
+    results = []
+    total = 0
+    try:
+        with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                if total >= offset and (limit is None or len(results) < limit):
+                    results.append(line)
+                total += 1
+        return results, total
+    except Exception:
+        return [], 0
+
+
+def get_latest_nrd_domains(limit: int | None = None, offset: int = 0) -> tuple:
     path = find_latest_nrd_file()
     if not path:
-        return ('', [])
+        return ('', [], 0)
     filename = os.path.basename(path)
-    domains = read_domains_from_file(path)
-    return (filename, domains)
+    if limit is None and offset == 0:
+        domains = read_domains_from_file(path)
+        return (filename, domains, len(domains))
+    else:
+        domains_slice, total = read_domains_from_file_slice(path, offset=offset, limit=limit)
+        return (filename, domains_slice, total)

@@ -7,6 +7,9 @@ import os
 from plugins.file_utils import get_latest_nrd_domains
 from plugins.brand_search import brand_search as run_brand_search
 from plugins.log_utils import clean_log
+from plugins.whois_query import get_whois_info
+from fastapi import Query
+
 
 app = FastAPI()
 
@@ -22,6 +25,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+@app.get('/whois')
+async def whois_query(domain: str = Query(...)):
+    result = get_whois_info(domain)
+    return result
 
 @app.get("/health")
 async def health_check():
@@ -29,25 +36,25 @@ async def health_check():
 
 
 @app.get('/nrd-latest')
-async def nrd_latest():
-    filename, domains = get_latest_nrd_domains()
-    return {"filename": filename, "domains": domains}
+async def nrd_latest(limit: int | None = Query(None), offset: int = Query(0)):
+    filename, domains, total = get_latest_nrd_domains(limit=limit, offset=offset)
+    return {"filename": filename, "domains": domains, "total": total}
 
 
 @app.post('/brand-search')
-async def brand_search(payload: dict):
+async def brand_search(payload: dict, limit: int = Query(100), offset: int = Query(0)):
     from plugins.file_utils import find_latest_nrd_file
 
     brand = payload.get('brand') if isinstance(payload, dict) else None
     if not brand or not isinstance(brand, str):
-        return {"results": []}
+        return {"results": [], "total": 0}
 
     filepath = find_latest_nrd_file()
     if not filepath:
-        return {"results": []}
+        return {"results": [], "total": 0}
 
-    results = run_brand_search(brand, filepath)
-    return {"results": results}
+    data = run_brand_search(brand, filepath, limit=limit, offset=offset)
+    return {"results": data.get("results", []), "total": data.get("total", 0)}
 
 
 @app.get("/dump-nrd")

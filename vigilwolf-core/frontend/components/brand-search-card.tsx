@@ -20,26 +20,57 @@ export default function BrandSearchCard({ onViewWhois }: BrandSearchCardProps) {
   const [domains, setDomains] = useState<string[]>([])
   const [filename, setFilename] = useState('')
   const [showFile, setShowFile] = useState(false)
+  const [fileTotal, setFileTotal] = useState(0)
+  const [filePage, setFilePage] = useState(0)
+  const FILE_LIMIT = 200
+  const [loadingFileMore, setLoadingFileMore] = useState(false)
   const [results, setResults] = useState<DomainResult[]>([])
+  const [total, setTotal] = useState(0)
+  const [page, setPage] = useState(0)
+  const LIMIT = 100
+  const [loadingMore, setLoadingMore] = useState(false)
 
   const handleShowFile = async () => {
     try {
-      const res = await fetch(getApiUrl(API_ENDPOINTS.NRD_LATEST))
+      setFilePage(0)
+      const res = await fetch(getApiUrl(`${API_ENDPOINTS.NRD_LATEST}?limit=${FILE_LIMIT}&offset=0`))
       if (!res.ok) return
       const data = await res.json()
       setFilename(data.filename || '')
       setDomains(data.domains || [])
+      setFileTotal(data.total || 0)
       setShowFile(true)
     } catch (e) {
       console.error('Failed to load latest NRD file', e)
     }
   }
 
+  const loadMoreFile = async () => {
+    if (loadingFileMore) return
+    const nextOffset = (filePage + 1) * FILE_LIMIT
+    if (nextOffset >= fileTotal) return
+    setLoadingFileMore(true)
+    try {
+      const res = await fetch(getApiUrl(`${API_ENDPOINTS.NRD_LATEST}?limit=${FILE_LIMIT}&offset=${nextOffset}`))
+      if (!res.ok) throw new Error('failed to load file page')
+      const data = await res.json()
+      setDomains(prev => prev.concat(data.domains || []))
+      setFilePage(prev => prev + 1)
+    } catch (e) {
+      console.error('Failed to load more file data', e)
+    } finally {
+      setLoadingFileMore(false)
+    }
+  }
+
   const handleSearch = async () => {
     if (!brandName.trim()) return
     setIsSearching(true)
+    setResults([])
+    setTotal(0)
+    setPage(0)
     try {
-      const res = await fetch(getApiUrl(API_ENDPOINTS.BRAND_SEARCH), {
+      const res = await fetch(getApiUrl(`${API_ENDPOINTS.BRAND_SEARCH}?limit=${LIMIT}&offset=0`), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ brand: brandName }),
@@ -48,11 +79,34 @@ export default function BrandSearchCard({ onViewWhois }: BrandSearchCardProps) {
       if (!res.ok) throw new Error('search failed')
       const data = await res.json()
       setResults(data.results || [])
+      setTotal(data.total || 0)
     } catch (e) {
       console.error('Brand search failed', e)
       setResults([])
     } finally {
       setIsSearching(false)
+    }
+  }
+
+  const loadMore = async () => {
+    if (loadingMore) return
+    const nextOffset = (page + 1) * LIMIT
+    if (nextOffset >= total) return
+    setLoadingMore(true)
+    try {
+      const res = await fetch(getApiUrl(`${API_ENDPOINTS.BRAND_SEARCH}?limit=${LIMIT}&offset=${nextOffset}`), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ brand: brandName }),
+      })
+      if (!res.ok) throw new Error('failed to load more')
+      const data = await res.json()
+      setResults(prev => prev.concat(data.results || []))
+      setPage(prev => prev + 1)
+    } catch (e) {
+      console.error('Failed to load more results', e)
+    } finally {
+      setLoadingMore(false)
     }
   }
 
@@ -138,9 +192,25 @@ export default function BrandSearchCard({ onViewWhois }: BrandSearchCardProps) {
                   </td>
                 </tr>
               ))}
+              {results.length === 0 && !isSearching && (
+                <tr>
+                  <td colSpan={4} className="py-4 px-2 text-center text-muted-foreground">No results</td>
+                </tr>
+              )}
             </tbody>
           </table>
         </div>
+        {results.length < total && (
+          <div className="flex justify-center mt-3">
+            <button
+              onClick={loadMore}
+              disabled={loadingMore}
+              className="bg-muted hover:bg-muted/90 text-muted-foreground px-3 py-1 rounded-md text-sm"
+            >
+              {loadingMore ? 'Loading...' : `Load more (${results.length}/${total})`}
+            </button>
+          </div>
+        )}
       </div>
     </div>
   )
