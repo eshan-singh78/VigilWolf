@@ -136,13 +136,13 @@ You get clear visibility into:
 
 ---
 
-## 🐳 Running VigilWolf with Docker
+## Running VigilWolf with Docker
 
 VigilWolf ships with:
 - **Dockerfile**
 - **start.sh** — a simple one-command startup helper  
 
-### ▶️ Quick Start
+### Quick Start
 ```bash
 ./start.sh
 
@@ -172,7 +172,7 @@ http://localhost:PORT
 
 ----------
 
-## 🙌 Who Is VigilWolf For?
+## Who Is VigilWolf For?
 
 -   Brand protection teams
     
@@ -189,7 +189,7 @@ http://localhost:PORT
 
 
 
-## ❤️ Contributions
+## Contributions ❤️ 
 
 Issues, feature suggestions, and PRs are welcome!  
 VigilWolf grows stronger with the pack.
