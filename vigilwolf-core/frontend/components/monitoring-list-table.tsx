@@ -1,6 +1,7 @@
 'use client'
 
 import { ExternalLink, AlertCircle } from 'lucide-react'
+import { useRouter } from 'next/navigation'
 
 interface MonitoredDomain {
   id: string
@@ -9,14 +10,20 @@ interface MonitoredDomain {
   baselineStatus: 'Done' | 'Pending'
   lastCheck: string
   changeDetected: boolean
+  groupId: string
 }
 
 interface MonitoringListTableProps {
   domains: MonitoredDomain[]
-  onExplore: (domain: MonitoredDomain) => void
 }
 
-export default function MonitoringListTable({ domains, onExplore }: MonitoringListTableProps) {
+export default function MonitoringListTable({ domains }: MonitoringListTableProps) {
+  const router = useRouter()
+
+  const handleExplore = (domainId: string) => {
+    router.push(`/domain/${domainId}`)
+  }
+
   return (
     <div className="bg-card rounded-xl border border-border shadow-sm overflow-hidden">
       <div className="p-6 border-b border-border">
@@ -65,7 +72,7 @@ export default function MonitoringListTable({ domains, onExplore }: MonitoringLi
                 </td>
                 <td className="py-4 px-6 text-center">
                   <button
-                    onClick={() => onExplore(domain)}
+                    onClick={() => handleExplore(domain.id)}
                     className="p-1.5 hover:bg-border rounded transition-colors inline-flex items-center gap-1 text-accent text-xs font-medium"
                   >
                     <ExternalLink className="w-4 h-4" />

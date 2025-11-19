@@ -1,0 +1,7 @@
+.kiro/
+.vscode/
+.hypothesis/
+__pycache__/
+.pytest_cache/
+test*.py
+data/

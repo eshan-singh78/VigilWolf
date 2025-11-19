@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-set -e
+# Don't exit on error - we want to try all days even if some fail
+set +e
 
 RED="\033[31m"
 GREEN="\033[32m"
@@ -31,17 +32,49 @@ for i in $(seq 0 $((DAY_RANGE-1))); do
 
     echo -e "${CYAN}------------------------------------------${RESET}"
     echo -e "${GREEN}Downloading NRD for: $TODAY${RESET}"
-    curl -L "$URL" -o "$ZIP_FILE"
+    
+    # Download with error handling
+    if ! curl -L "$URL" -o "$ZIP_FILE" 2>/dev/null; then
+        echo -e "${RED}Failed to download NRD for $TODAY - skipping${RESET}"
+        continue
+    fi
+    
+    # Check if file is actually a valid zip
+    if [ ! -s "$ZIP_FILE" ]; then
+        echo -e "${RED}Downloaded file is empty for $TODAY - skipping${RESET}"
+        rm -f "$ZIP_FILE"
+        continue
+    fi
 
     echo -e "${GREEN}Extracting $ZIP_FILE ...${RESET}"
     mkdir -p "$EXTRACT_DIR"
-    unzip -o "$ZIP_FILE" -d "$EXTRACT_DIR"
+    
+    # Try to unzip with error handling
+    if ! unzip -o "$ZIP_FILE" -d "$EXTRACT_DIR" 2>/dev/null; then
+        echo -e "${RED}Failed to extract $ZIP_FILE (corrupted or invalid) - skipping${RESET}"
+        rm -f "$ZIP_FILE"
+        continue
+    fi
 
-    find "$EXTRACT_DIR" -type f -name "domain-names.txt" -exec cat {} + >> "$MERGED_FILE"
+    # Only append if domain-names.txt exists
+    if find "$EXTRACT_DIR" -type f -name "domain-names.txt" -exec false {} +; then
+        echo -e "${RED}No domain-names.txt found for $TODAY - skipping${RESET}"
+    else
+        find "$EXTRACT_DIR" -type f -name "domain-names.txt" -exec cat {} + >> "$MERGED_FILE"
+        echo -e "${GREEN}Successfully added domains from $TODAY${RESET}"
+    fi
 done
 
 echo -e "${CYAN}------------------------------------------${RESET}"
-echo -e "${GREEN}Static merged file done: $MERGED_FILE${RESET}"
+
+# Check if we got any domains
+DOMAIN_COUNT=$(grep -v "^#" "$MERGED_FILE" | grep -v "^$" | wc -l | tr -d ' ')
+if [ "$DOMAIN_COUNT" -eq 0 ]; then
+    echo -e "${RED}WARNING: No domains were successfully downloaded!${RESET}"
+    echo -e "${RED}All NRD sources failed or were unavailable.${RESET}"
+else
+    echo -e "${GREEN}Static merged file done: $MERGED_FILE (${DOMAIN_COUNT} domains)${RESET}"
+fi
 
 # ---------------------------
 # Folder for timestamped dumps
@@ -53,6 +86,7 @@ TIMESTAMP=$(date -u "+%Y-%m-%d_%H-%M-%S")
 TIMESTAMPED_FILE="$DUMP_DIR/nrd-${TIMESTAMP}.txt"
 echo "# Timestamped NRD merge: $TIMESTAMP" > "$TIMESTAMPED_FILE"
 
+TIMESTAMPED_COUNT=0
 for dir in "$TEMP_DIR"/*/; do
     [ -d "$dir" ] || continue
     FILE="$dir/domain-names.txt"
@@ -61,9 +95,21 @@ for dir in "$TEMP_DIR"/*/; do
         echo "# Domains from $(basename "$dir")" >> "$TIMESTAMPED_FILE"
         cat "$FILE" >> "$TIMESTAMPED_FILE"
         echo "" >> "$TIMESTAMPED_FILE"
+        TIMESTAMPED_COUNT=$((TIMESTAMPED_COUNT + 1))
     fi
 done
 
-echo -e "${GREEN}Timestamped merged file created: $TIMESTAMPED_FILE${RESET}"
+if [ "$TIMESTAMPED_COUNT" -eq 0 ]; then
+    echo -e "${RED}No timestamped file created - no valid data available${RESET}"
+    rm -f "$TIMESTAMPED_FILE"
+    echo -e "${RED}All NRD downloads failed. This may be temporary - try again later.${RESET}"
+    exit 1
+else
+    echo -e "${GREEN}Timestamped merged file created: $TIMESTAMPED_FILE${RESET}"
+fi
+
 echo -e "${CYAN}Temporary files remain in: $TEMP_DIR${RESET}"
 echo -e "${CYAN}All timestamped files are in folder: $DUMP_DIR${RESET}"
+
+# Exit successfully if we got at least some data
+exit 0

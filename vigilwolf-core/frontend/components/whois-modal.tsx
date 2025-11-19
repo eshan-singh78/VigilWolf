@@ -38,6 +38,11 @@ export default function WhoisModal({ domain, onClose }: WhoisModalProps) {
             <div className="text-center text-muted-foreground text-lg">fetching...</div>
           ) : whois && !whois.error ? (
             <>
+              {whois.method && (
+                <div className="text-xs text-muted-foreground mb-2">
+                  Retrieved via: {whois.method}
+                </div>
+              )}
               <div>
                 <h3 className="text-sm font-semibold text-foreground mb-3">Summary</h3>
                 <div className="grid grid-cols-2 gap-4 text-sm">
@@ -61,7 +66,7 @@ export default function WhoisModal({ domain, onClose }: WhoisModalProps) {
               </div>
               <div>
                 <h3 className="text-sm font-semibold text-foreground mb-3">DNS Information</h3>
-                <div className="space-y-2 text-sm font-mono text-foreground bg-muted p-3 rounded-lg">
+                <div className="space-y-2 text-sm font-mono text-foreground bg-muted p-3 rounded-lg max-h-48 overflow-auto">
                   {whois.name_servers && Array.isArray(whois.name_servers)
                     ? whois.name_servers.map((ns: string, i: number) => <p key={i}>{ns}</p>)
                     : <p>-</p>}
@@ -75,9 +80,31 @@ export default function WhoisModal({ domain, onClose }: WhoisModalProps) {
                   <p className="text-muted-foreground">Emails: <span className="text-foreground font-mono">{whois.emails ? (Array.isArray(whois.emails) ? whois.emails.join(', ') : whois.emails) : '-'}</span></p>
                 </div>
               </div>
+              {whois.raw_output && (
+                <div>
+                  <h3 className="text-sm font-semibold text-foreground mb-3">Raw Output (Preview)</h3>
+                  <div className="text-xs font-mono text-muted-foreground bg-muted p-3 rounded-lg max-h-32 overflow-auto whitespace-pre-wrap">
+                    {whois.raw_output}
+                  </div>
+                </div>
+              )}
             </>
           ) : (
-            <div className="text-center text-destructive text-lg">{whois?.error || 'No WHOIS info found.'}</div>
+            <div className="space-y-4">
+              <div className="text-center text-destructive text-lg">
+                {whois?.error || 'No WHOIS info found.'}
+              </div>
+              {whois?.details && Array.isArray(whois.details) && (
+                <div className="bg-muted p-4 rounded-lg">
+                  <p className="text-sm font-semibold text-foreground mb-2">Error Details:</p>
+                  <ul className="text-xs text-muted-foreground space-y-1">
+                    {whois.details.map((detail: string, i: number) => (
+                      <li key={i}>• {detail}</li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+            </div>
           )}
         </div>
       </div>

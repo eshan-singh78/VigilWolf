@@ -1,0 +1,47 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+*.egg-info/
+dist/
+build/
+
+# Testing
+.pytest_cache/
+.hypothesis/
+htmlcov/
+.coverage
+.tox/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Monitoring data (will be in volume)
+monitoring_data/
+
+# NRD files (will be downloaded at runtime)
+domain-names.txt
+nrd-*.txt
+nrdtemp/
+nrd-file-dump/
+
+# Git
+.git/
+.gitignore
+
+# Documentation
+README.md
+*.md

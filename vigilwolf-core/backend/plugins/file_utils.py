@@ -2,35 +2,50 @@ import os
 
 
 def find_latest_nrd_file() -> str:
+    import logging
+    logger = logging.getLogger(__name__)
+    
     candidates = []
-    backend_dir = os.path.dirname(__file__)
-
-    nrdtemp_base = os.path.join(backend_dir, '..', 'nrdtemp')
-    if os.path.isdir(nrdtemp_base):
-        for entry in os.listdir(nrdtemp_base):
-            sub = os.path.join(nrdtemp_base, entry)
-            candidate = os.path.join(sub, 'domain-names.txt')
-            if os.path.isfile(candidate):
-                candidates.append(candidate)
-
-    nrd_dump = os.path.join(backend_dir, '..', 'nrd-file-dump')
+    
+    # Get the backend directory (where the script runs from)
+    # In Docker, this will be /app
+    backend_dir = os.path.abspath(os.path.dirname(os.path.dirname(__file__)))
+    logger.info(f"Searching for NRD files in backend_dir: {backend_dir}")
+    
+    # ONLY check nrd-file-dump directory for timestamped files
+    # This is where nrd-fix-portable.sh saves the final timestamped files
+    nrd_dump = os.path.join(backend_dir, 'nrd-file-dump')
     if os.path.isdir(nrd_dump):
+        logger.info(f"Checking nrd-file-dump directory: {nrd_dump}")
         for entry in os.listdir(nrd_dump):
-            candidate = os.path.join(nrd_dump, entry)
-            if os.path.isfile(candidate) and entry.lower().endswith('.txt'):
-                candidates.append(candidate)
-
+            # Only consider files that match the pattern: nrd-YYYY-MM-DD_HH-MM-SS.txt
+            if entry.startswith('nrd-') and entry.endswith('.txt') and '_' in entry:
+                candidate = os.path.join(nrd_dump, entry)
+                if os.path.isfile(candidate):
+                    candidates.append(candidate)
+                    logger.info(f"Found timestamped NRD file: {entry}")
+    else:
+        logger.warning(f"nrd-file-dump directory does not exist: {nrd_dump}")
+    
+    if not candidates:
+        logger.warning("No timestamped NRD files found in nrd-file-dump")
+        return ''
+    
+    # Find the most recently modified file (should be the latest dump)
     latest_path = ''
     latest_mtime = 0
     for c in candidates:
         try:
             m = os.path.getmtime(c)
+            logger.info(f"Candidate: {os.path.basename(c)}, mtime: {m}")
             if m > latest_mtime:
                 latest_mtime = m
                 latest_path = c
-        except Exception:
+        except Exception as e:
+            logger.warning(f"Error checking {c}: {e}")
             continue
-
+    
+    logger.info(f"Selected latest NRD file: {os.path.basename(latest_path) if latest_path else 'None'}")
     return latest_path
 
 
