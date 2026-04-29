@@ -1,0 +1,62 @@
+services:
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: vigilwolf-backend
+    ports:
+      - "8000:8000"
+    volumes:
+      # Named volume only - bind mount removed to avoid permission conflicts with non-root user
+      - backend-data:/app/monitoring_data
+    environment:
+      - PYTHONUNBUFFERED=1
+      - MONITORING_DATA_DIR=/app/monitoring_data
+      - DATABASE_URL=sqlite:////app/monitoring_data/vigilwolf.db
+      # SECURITY: Change this before deploying to production
+      - API_KEY=change-me-in-production
+      - ENVIRONMENT=production
+      - ALLOWED_ORIGINS=http://localhost:3000,http://127.0.0.1:3000
+      - RATE_LIMIT_PER_MINUTE=60
+      - REDIS_URL=redis://redis:6379/0
+      - ENABLE_PROMETHEUS=true
+      - FORCE_HTTPS=true
+      - TRUSTED_HOSTS=localhost,127.0.0.1
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    depends_on:
+      - redis
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: vigilwolf-frontend
+    ports:
+      - "3000:3000"
+    environment:
+      - BACKEND_URL=http://backend:8000
+      - API_KEY=change-me-in-production
+    depends_on:
+      - backend
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    container_name: vigilwolf-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    restart: unless-stopped
+
+volumes:
+  backend-data:
+    driver: local
+  redis-data:
+    driver: local

@@ -1,0 +1,670 @@
+"""VigilWolf v2 — Dramatiq Worker Pipeline.
+
+Orchestrator + Fan-Out model:
+  capture_domain -> build_context_and_analyze -> orchestrate_analysis
+      -> (run plugins per group) -> aggregate_results -> dispatch_alert
+
+When USE_DRAMATIQ_PIPELINE=true, each pipeline stage is a Dramatiq actor
+that enqueues the next stage. When false (default), all stages run
+synchronously in-process — useful for development and testing.
+"""
+from __future__ import annotations
+
+import hashlib
+import logging
+import time as _time
+import uuid
+from datetime import datetime, timezone
+from typing import Any, Optional
+from urllib.parse import urlparse
+
+from bs4 import BeautifulSoup
+
+from plugins.base import AnalysisPlugin, PluginResult, PluginType, SnapshotContext
+from plugins.registry import PLUGIN_REGISTRY, get_execution_groups, circuit_breaker
+from services.scoring_service import calculate_score, apply_context_modifiers, DEFAULT_WEIGHTS
+from services.pipeline_metrics import pipeline_metrics
+import config
+
+logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Dramatiq broker — lazily initialised so imports don't fail without Redis
+# ---------------------------------------------------------------------------
+
+_dramatiq_broker = None
+_dramatiq_actors = {}
+
+
+def _get_broker():
+    """Return (and lazily create) the Dramatiq Redis broker."""
+    global _dramatiq_broker
+    if _dramatiq_broker is not None:
+        return _dramatiq_broker
+    import dramatiq
+    from dramatiq.brokers.redis import RedisBroker
+    _dramatiq_broker = RedisBroker(url=config.DRAMATIQ_BROKER_URL)
+    dramatiq.set_broker(_dramatiq_broker)
+    return _dramatiq_broker
+
+
+def _get_actors():
+    """Return (and lazily create) the Dramatiq actor wrappers.
+
+    Called only when USE_DRAMATIQ_PIPELINE is True. Each actor wraps the
+    corresponding synchronous function and enqueues the next stage.
+    """
+    global _dramatiq_actors
+    if _dramatiq_actors:
+        return _dramatiq_actors
+    import dramatiq
+
+    broker = _get_broker()
+
+    @dramatiq.actor(broker=broker)
+    def capture_domain_actor(domain_id: str, url: str, trigger_type: str = "nrd_ingest"):
+        result = capture_domain(domain_id=domain_id, url=url, trigger_type=trigger_type)
+        return result
+
+    @dramatiq.actor(broker=broker)
+    def build_context_and_analyze_actor(snapshot_id: str, domain_id: str, url: str, html: str, snapshot_record: dict):
+        build_context_and_analyze(
+            snapshot_id=snapshot_id, domain_id=domain_id, url=url,
+            html=html, snapshot_record=snapshot_record,
+        )
+
+    _dramatiq_actors = {
+        "capture_domain": capture_domain_actor,
+        "build_context_and_analyze": build_context_and_analyze_actor,
+    }
+    return _dramatiq_actors
+
+
+# ---------------------------------------------------------------------------
+# Prometheus helpers (lazy import so tests without prometheus_client work)
+# ---------------------------------------------------------------------------
+
+def _get_plugin_timer(plugin_name: str):
+    """Return a context-manager that records Histogram timing for a plugin.
+
+    Returns ``None`` when Prometheus is disabled or prometheus_client is not
+    installed, so callers can skip the timing block with ``if timer: ...``.
+    """
+    if not config.ENABLE_PROMETHEUS:
+        return None
+    try:
+        from main import PIPELINE_DURATION
+        if PIPELINE_DURATION is None:
+            return None
+        return PIPELINE_DURATION.labels(plugin_name=plugin_name).time()
+    except ImportError:
+        return None
+
+
+def _inc_domains_processed() -> None:
+    """Increment the Prometheus counter for processed domains."""
+    if not config.ENABLE_PROMETHEUS:
+        return
+    try:
+        from main import PIPELINE_DOMAINS_PROCESSED
+        if PIPELINE_DOMAINS_PROCESSED is not None:
+            PIPELINE_DOMAINS_PROCESSED.inc()
+    except ImportError:
+        pass
+
+
+def _emit_processing_update(snapshot_id: str, domain: str, plugin_name: str, status: str) -> None:
+    """Publish a processing_update event to the event bus (fire-and-forget)."""
+    try:
+        from services.event_bus import event_bus
+        event_bus.publish("processing_update", {
+            "snapshot_id": snapshot_id,
+            "domain": domain,
+            "plugin": plugin_name,
+            "status": status,
+        })
+    except Exception:
+        logger.exception("Failed to publish processing_update event")
+
+
+# ---------------------------------------------------------------------------
+# build_snapshot_context
+# ---------------------------------------------------------------------------
+
+def build_snapshot_context(
+    snapshot_id: str,
+    domain: str,
+    html: str,
+    snapshot_record: dict,
+) -> SnapshotContext:
+    """Parse raw HTML and build a SnapshotContext for the analysis pipeline.
+
+    Extracts visible text, forms (with password/hidden/action/method),
+    links, scripts, and metadata (title + meta tags).
+    """
+    soup = BeautifulSoup(html, "html.parser")
+
+    # --- Visible text ---
+    text = soup.get_text(separator=" ", strip=True)
+
+    # --- Forms ---
+    forms: list[dict[str, Any]] = []
+    for form_el in soup.find_all("form"):
+        form_info: dict[str, Any] = {
+            "has_password": any(
+                inp.get("type", "").lower() == "password"
+                for inp in form_el.find_all("input")
+            ),
+            "has_hidden": any(
+                inp.get("type", "").lower() == "hidden"
+                for inp in form_el.find_all("input")
+            ),
+            "action": form_el.get("action", ""),
+            "method": (form_el.get("method", "GET") or "GET").upper(),
+        }
+        forms.append(form_info)
+
+    # --- Links ---
+    links = [
+        a_tag.get("href", "")
+        for a_tag in soup.find_all("a", href=True)
+    ]
+
+    # --- Scripts ---
+    scripts: list[dict[str, Any]] = []
+    for script_el in soup.find_all("script"):
+        src = script_el.get("src")
+        inline = script_tag_text(script_el)
+        entry: dict[str, Any] = {}
+        if src:
+            entry["src"] = src
+        if inline:
+            entry["inline"] = inline
+        scripts.append(entry)
+
+    # --- Metadata ---
+    metadata: dict[str, Any] = {}
+    title_el = soup.find("title")
+    if title_el and title_el.string:
+        metadata["title"] = title_el.string.strip()
+
+    meta_tags: dict[str, str] = {}
+    for meta_el in soup.find_all("meta"):
+        name = meta_el.get("name") or meta_el.get("property") or meta_el.get("http-equiv")
+        content = meta_el.get("content")
+        if name and content:
+            meta_tags[name] = content
+    if meta_tags:
+        metadata["meta"] = meta_tags
+
+    return SnapshotContext(
+        snapshot_id=snapshot_id,
+        domain=domain,
+        html=html,
+        text=text,
+        forms=forms,
+        links=links,
+        scripts=scripts,
+        metadata=metadata,
+        snapshot_record=snapshot_record,
+    )
+
+
+def script_tag_text(script_el) -> str:
+    """Extract inline script content, or empty string if external."""
+    if script_el.get("src"):
+        return ""
+    return (script_el.string or "").strip()
+
+
+# ---------------------------------------------------------------------------
+# get_registered_plugins
+# ---------------------------------------------------------------------------
+
+def get_registered_plugins() -> list[AnalysisPlugin]:
+    """Instantiate and return the plugins listed in config.ENABLED_PLUGINS.
+
+    Plugins that are configured as enabled but not found in the registry
+    are logged as warnings and skipped.
+    """
+    enabled = [name.strip() for name in config.ENABLED_PLUGINS if name.strip()]
+    plugins: list[AnalysisPlugin] = []
+
+    for name in enabled:
+        cls = PLUGIN_REGISTRY.get(name)
+        if cls is None:
+            logger.warning("Plugin %r listed in ENABLED_PLUGINS but not registered; skipping.", name)
+            continue
+        plugins.append(cls())
+
+    return plugins
+
+
+# ---------------------------------------------------------------------------
+# capture_domain  (DB-dependent, lazy imports)
+# ---------------------------------------------------------------------------
+
+def capture_domain(domain_id: str, url: str, trigger_type: str = "nrd_ingest") -> Optional[str]:
+    """Capture HTML for a domain and kick off the analysis pipeline.
+
+    1. Capture HTML via capture_engine
+    2. Compute SHA-256
+    3. Check for duplicate snapshot (same domain_id + sha256)
+    4. Save to storage, create SnapshotModel
+    5. Delegate to build_context_and_analyze()
+
+    Returns the snapshot_id on success, None on failure.
+    """
+    try:
+        from plugins.capture_engine import capture_html  # type: ignore[import-untyped]
+    except ImportError:
+        logger.error("capture_engine module not available; cannot capture domain.")
+        return None
+
+    try:
+        # Step 1 — Capture HTML
+        capture_result = capture_html(url)
+        if not capture_result or not capture_result.get("html"):
+            logger.error("capture_html returned no HTML for url=%s", url)
+            return None
+        html = capture_result["html"]
+
+        # Step 2 — SHA-256
+        sha256 = hashlib.sha256(html.encode("utf-8", errors="replace")).hexdigest()
+
+        # Step 3 — Duplicate check
+        from database import get_session, SnapshotModel as _SnapshotModel
+
+        with get_session() as session:
+            existing = (
+                session.query(_SnapshotModel)
+                .filter_by(domain_id=domain_id, sha256=sha256)
+                .first()
+            )
+            if existing:
+                logger.info(
+                    "Duplicate snapshot for domain_id=%s sha256=%s; skipping.",
+                    domain_id, sha256[:12],
+                )
+                return existing.id
+
+        # Step 4 — Save to storage & create SnapshotModel
+        from database import get_session as _get_session, SnapshotModel
+
+        snapshot_id = str(uuid.uuid4())
+        snapshot_record_dict = {
+            "id": snapshot_id,
+            "domain_id": domain_id,
+        }
+
+        try:
+            from plugins.storage_manager import save_snapshot  # type: ignore[import-untyped]
+            save_result = save_snapshot(
+                domain_id=domain_id,
+                snapshot_id=snapshot_id,
+                html=html,
+            )
+            html_path = save_result.get("html_path", "") if save_result else ""
+        except ImportError:
+            logger.warning("storage_manager not available; saving html_path as empty string.")
+            html_path = ""
+
+        with _get_session() as session:
+            snapshot = SnapshotModel(
+                id=snapshot_id,
+                domain_id=domain_id,
+                timestamp=datetime.now(timezone.utc),
+                trigger_type=trigger_type,
+                html_path=html_path,
+                sha256=sha256,
+                size_bytes=len(html.encode("utf-8", errors="replace")),
+                success=True,
+            )
+            session.add(snapshot)
+            session.commit()
+
+        # Step 5 — Build context and analyze (sync or Dramatiq)
+        if config.USE_DRAMATIQ_PIPELINE:
+            actors = _get_actors()
+            actors["build_context_and_analyze"].send(
+                snapshot_id=snapshot_id,
+                domain_id=domain_id,
+                url=url,
+                html=html,
+                snapshot_record=snapshot_record_dict,
+            )
+        else:
+            build_context_and_analyze(
+                snapshot_id=snapshot_id,
+                domain_id=domain_id,
+                url=url,
+                html=html,
+                snapshot_record=snapshot_record_dict,
+            )
+
+        return snapshot_id
+
+    except Exception:
+        logger.exception("capture_domain failed for url=%s", url)
+        return None
+
+
+# ---------------------------------------------------------------------------
+# build_context_and_analyze  (DB-dependent, lazy imports)
+# ---------------------------------------------------------------------------
+
+def build_context_and_analyze(
+    snapshot_id: str,
+    domain_id: str,
+    url: str,
+    html: str,
+    snapshot_record: dict,
+) -> None:
+    """Build a SnapshotContext and run the full analysis pipeline."""
+    # Extract domain from URL for the context
+    parsed = urlparse(url)
+    domain = parsed.netloc or url
+
+    ctx = build_snapshot_context(
+        snapshot_id=snapshot_id,
+        domain=domain,
+        html=html,
+        snapshot_record=snapshot_record,
+    )
+
+    orchestrate_analysis(ctx)
+
+
+# ---------------------------------------------------------------------------
+# orchestrate_analysis  (DB-dependent, lazy imports)
+# ---------------------------------------------------------------------------
+
+def orchestrate_analysis(ctx: SnapshotContext) -> None:
+    """Run all enabled plugins grouped by execution order, then aggregate.
+
+    For each execution group, run every plugin sequentially (Phase 1).
+    Skip plugins that the circuit breaker rejects.
+    """
+    _start = _time.time()
+
+    from database import get_session, SnapshotPluginStatusModel, AnalysisResultModel
+
+    try:
+        execution_groups = get_execution_groups()
+        plugins_by_name = {p.name: p for p in get_registered_plugins()}
+        all_results: list[PluginResult] = []
+
+        # Create pending status rows for every enabled plugin
+        with get_session() as session:
+            for group in execution_groups:
+                for plugin_name, _priority in group.plugins:
+                    existing = (
+                        session.query(SnapshotPluginStatusModel)
+                        .filter_by(snapshot_id=ctx.snapshot_id, plugin_name=plugin_name)
+                        .first()
+                    )
+                    if existing is None:
+                        status_row = SnapshotPluginStatusModel(
+                            snapshot_id=ctx.snapshot_id,
+                            plugin_name=plugin_name,
+                            status="pending",
+                        )
+                        session.add(status_row)
+            session.commit()
+
+        # Run each group sequentially
+        for group in execution_groups:
+            for plugin_name, _priority in group.plugins:
+                plugin = plugins_by_name.get(plugin_name)
+                if plugin is None:
+                    logger.warning("Plugin %r not found in registry; skipping.", plugin_name)
+                    continue
+
+                # Check circuit breaker
+                if not circuit_breaker.should_run(plugin_name, plugin.plugin_type, queue_depth=0):
+                    logger.info("Circuit breaker skipping plugin %r.", plugin_name)
+                    continue
+
+                # Update status -> running
+                with get_session() as session:
+                    status_row = (
+                        session.query(SnapshotPluginStatusModel)
+                        .filter_by(snapshot_id=ctx.snapshot_id, plugin_name=plugin_name)
+                        .first()
+                    )
+                    if status_row:
+                        status_row.status = "running"
+                        status_row.started_at = datetime.now(timezone.utc)
+                        session.commit()
+
+                # Publish processing_update event for SSE streaming
+                _emit_processing_update(ctx.snapshot_id, ctx.domain, plugin_name, "running")
+
+                # Run the plugin with Prometheus timing
+                _timer = _get_plugin_timer(plugin_name)
+                try:
+                    if _timer is not None:
+                        with _timer:
+                            result = plugin.run(ctx)
+                    else:
+                        result = plugin.run(ctx)
+                    all_results.append(result)
+
+                    # Store AnalysisResultModel
+                    with get_session() as session:
+                        analysis_row = AnalysisResultModel(
+                            snapshot_id=ctx.snapshot_id,
+                            plugin_name=result.plugin_name,
+                            plugin_version=result.plugin_version,
+                            plugin_type=result.plugin_type.value,
+                            result_json={
+                                "tags": result.tags,
+                                "findings": result.findings,
+                                "error": result.error,
+                            },
+                            score_contribution=result.score_contribution,
+                            confidence=result.confidence,
+                            tags=result.tags,
+                        )
+                        session.add(analysis_row)
+                        session.commit()
+
+                    # Update status -> done
+                    with get_session() as session:
+                        status_row = (
+                            session.query(SnapshotPluginStatusModel)
+                            .filter_by(snapshot_id=ctx.snapshot_id, plugin_name=plugin_name)
+                            .first()
+                        )
+                        if status_row:
+                            status_row.status = "done"
+                            status_row.completed_at = datetime.now(timezone.utc)
+                            session.commit()
+
+                    # Publish processing_update event for SSE streaming
+                    _emit_processing_update(ctx.snapshot_id, ctx.domain, plugin_name, "done")
+
+                except Exception:
+                    logger.exception("Plugin %r failed for snapshot_id=%s", plugin_name, ctx.snapshot_id)
+
+                    # Update status -> failed
+                    try:
+                        with get_session() as session:
+                            status_row = (
+                                session.query(SnapshotPluginStatusModel)
+                                .filter_by(snapshot_id=ctx.snapshot_id, plugin_name=plugin_name)
+                                .first()
+                            )
+                            if status_row:
+                                status_row.status = "failed"
+                                status_row.completed_at = datetime.now(timezone.utc)
+                                status_row.error_message = "Plugin execution error"
+                                session.commit()
+                    except Exception:
+                        logger.exception("Failed to update plugin status for %r", plugin_name)
+
+                    # Publish processing_update event for SSE streaming
+                    _emit_processing_update(ctx.snapshot_id, ctx.domain, plugin_name, "failed")
+
+        # Aggregate results and score
+        aggregate_results(ctx, all_results)
+
+        # Increment Prometheus counter for domains processed
+        _inc_domains_processed()
+
+        # Record pipeline success metric
+        pipeline_metrics.record_success(_time.time() - _start)
+
+    except Exception:
+        pipeline_metrics.record_failure()
+        raise
+
+
+# ---------------------------------------------------------------------------
+# aggregate_results  (DB-dependent, lazy imports)
+# ---------------------------------------------------------------------------
+
+def aggregate_results(ctx: SnapshotContext, results: list[PluginResult]) -> dict:
+    """Load weights, calculate the risk score, persist RiskScoreModel, and
+    dispatch an alert if high risk.
+
+    Returns the score outcome dict.
+    """
+    from database import get_session, PluginWeightModel, RiskScoreModel
+
+    # Load weights from DB, fall back to defaults
+    weights: dict[str, float] = DEFAULT_WEIGHTS.copy()
+    try:
+        with get_session() as session:
+            rows = session.query(PluginWeightModel).all()
+            if rows:
+                weights = {row.plugin_name: row.weight for row in rows}
+                logger.info("Loaded %d plugin weights from DB.", len(rows))
+    except Exception:
+        logger.warning("Could not load plugin weights from DB; using defaults.")
+
+    score_outcome = calculate_score(results, weights)
+
+    # Apply context-aware scoring modifiers (before hard signal re-check)
+    mod_result = apply_context_modifiers(
+        score_outcome["score"], ctx, score_outcome.get("reasons", [])
+    )
+    score_outcome["score"] = mod_result["score"]
+    score_outcome["risk_level"] = mod_result["risk_level"]
+    score_outcome["severity"] = mod_result["severity"]
+    score_outcome["reasons"].extend(mod_result["modifier_reasons"])
+
+    # Hard signal overrides context modifiers
+    if score_outcome.get("hard_signal"):
+        score_outcome["severity"] = "critical"
+        score_outcome["risk_level"] = "high"
+
+    # Persist RiskScoreModel
+    try:
+        with get_session() as session:
+            risk_score = RiskScoreModel(
+                snapshot_id=ctx.snapshot_id,
+                total_score=score_outcome["score"],
+                normalized_score=score_outcome["normalized_score"],
+                risk_level=score_outcome["risk_level"],
+                severity=score_outcome["severity"],
+                reasons=score_outcome["reasons"],
+                dominant_signals=score_outcome["dominant_signals"],
+                plugin_breakdown=score_outcome["plugin_breakdown"],
+                overall_confidence=score_outcome["overall_confidence"],
+            )
+            session.add(risk_score)
+            session.commit()
+    except Exception:
+        logger.exception("Failed to persist RiskScoreModel for snapshot_id=%s", ctx.snapshot_id)
+
+    # Publish threat_detected event for SSE streaming
+    if score_outcome["risk_level"] in ("high", "medium"):
+        try:
+            from services.event_bus import event_bus
+            event_bus.publish("threat_detected", {
+                "snapshot_id": ctx.snapshot_id,
+                "domain": ctx.domain,
+                "risk_level": score_outcome["risk_level"],
+                "severity": score_outcome.get("severity", ""),
+                "score": score_outcome["score"],
+                "dominant_signals": score_outcome.get("dominant_signals", []),
+            })
+        except Exception:
+            logger.exception("Failed to publish threat_detected event")
+
+    # Alert dispatch
+    if score_outcome["risk_level"] in ("high", "medium") and config.ALERTS_ENABLED:
+        dispatch_alert(ctx, score_outcome)
+
+    return score_outcome
+
+
+# ---------------------------------------------------------------------------
+# dispatch_alert  (may depend on AlertService, not yet implemented)
+# ---------------------------------------------------------------------------
+
+def dispatch_alert(ctx: SnapshotContext, score_outcome: dict) -> None:
+    """Dispatch an alert for a high-risk snapshot.
+
+    If ALERTS_DRY_RUN is true, log a dry-run message and return.
+    Otherwise, delegate to AlertService.send_alert().
+    """
+    if config.ALERTS_DRY_RUN:
+        logger.info(
+            "[DRY RUN] Would dispatch alert for snapshot_id=%s risk_level=%s score=%s",
+            ctx.snapshot_id, score_outcome["risk_level"], score_outcome["score"],
+        )
+        return
+
+    try:
+        from services.alert_service import AlertService  # type: ignore[import-untyped]
+        alert_service = AlertService()
+        alert_service.send_alert(
+            snapshot_id=ctx.snapshot_id,
+            domain=ctx.domain,
+            risk_level=score_outcome["risk_level"],
+            severity=score_outcome["severity"],
+            score=score_outcome["score"],
+            reasons=score_outcome.get("reasons", []),
+            dominant_signals=score_outcome.get("dominant_signals", []),
+        )
+
+        # Publish alert_dispatched event for SSE streaming
+        try:
+            from services.event_bus import event_bus
+            event_bus.publish("alert_dispatched", {
+                "snapshot_id": ctx.snapshot_id,
+                "domain": ctx.domain,
+                "risk_level": score_outcome["risk_level"],
+                "severity": score_outcome["severity"],
+            })
+        except Exception:
+            logger.exception("Failed to publish alert_dispatched event")
+
+    except ImportError:
+        logger.warning("AlertService not available; skipping alert dispatch.")
+    except Exception:
+        logger.exception("Failed to dispatch alert for snapshot_id=%s", ctx.snapshot_id)
+
+
+# ---------------------------------------------------------------------------
+# Public entry point — chooses sync vs Dramatiq path
+# ---------------------------------------------------------------------------
+
+def enqueue_capture(domain_id: str, url: str, trigger_type: str = "nrd_ingest") -> Optional[str]:
+    """Entry point for the analysis pipeline.
+
+    When USE_DRAMATIQ_PIPELINE is True, enqueues a Dramatiq message and
+    returns None immediately (processing is async). When False (default),
+    runs capture_domain synchronously and returns the snapshot_id.
+    """
+    if config.USE_DRAMATIQ_PIPELINE:
+        actors = _get_actors()
+        actors["capture_domain"].send(domain_id=domain_id, url=url, trigger_type=trigger_type)
+        logger.info("Enqueued Dramatiq capture for domain_id=%s url=%s", domain_id, url)
+        # Queue depth not directly exposed by Dramatiq; placeholder
+        pipeline_metrics.set_queue_depth(0)
+        return None
+    return capture_domain(domain_id=domain_id, url=url, trigger_type=trigger_type)

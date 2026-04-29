@@ -1,0 +1,15 @@
+frontend/node_modules/
+frontend/.next/
+frontend/out/
+frontend/.turbo/
+
+backend/__pycache__/
+backend/.pytest_cache/
+backend/.mypy_cache/
+backend/.ruff_cache/
+backend/.coverage
+backend/htmlcov/
+
+.DS_Store
+*.log
+*.sqlite3

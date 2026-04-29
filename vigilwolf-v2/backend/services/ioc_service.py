@@ -1,0 +1,537 @@
+"""IOC Service — Persist and query indicators of compromise.
+
+Handles deduplication, occurrence tracking, role classification, and
+relationship building for IOCs extracted by the ioc_extractor plugin.
+"""
+from __future__ import annotations
+
+import logging
+from datetime import datetime, timezone
+from typing import Optional
+from urllib.parse import urlparse
+
+from sqlalchemy import func
+from sqlalchemy.orm import Session
+
+logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Type mapping: findings key -> IocModel.type value
+# ---------------------------------------------------------------------------
+
+_IOC_TYPE_MAP = {
+    "domains": "domain",
+    "ips": "ip",
+    "urls": "url",
+    "emails": "email",
+    "telegram_handles": "telegram",
+    "crypto_wallets": "wallet",
+}
+
+# ---------------------------------------------------------------------------
+# Role classification constants
+# ---------------------------------------------------------------------------
+
+_CDN_KEYWORDS = (
+    "cdn",
+    "cloudfront",
+    "akamai",
+    "cloudflare",
+    "fastly",
+    "azureedge",
+    "googleapis",
+    "amazonaws",
+    "jsdelivr",
+    "unpkg",
+)
+
+_TRACKING_PIXEL_KEYWORDS = (
+    "pixel",
+    "tracking",
+    "analytics",
+    "telemetry",
+    "beacon",
+    "collect",
+    "gtm.",
+    "google-analytics",
+    "googletagmanager",
+    "facebook.com/tr",
+    "doubleclick",
+    "hotjar",
+    "mixpanel",
+    "segment",
+)
+
+
+# ---------------------------------------------------------------------------
+# Role classification helpers
+# ---------------------------------------------------------------------------
+
+
+def _classify_url_role(url: str) -> str:
+    """Classify the role of a URL IOC.
+
+    Returns one of: exfil_endpoint, cdn, tracking, redirect, resource.
+    """
+    url_lower = url.lower()
+
+    # Exfiltration endpoints: POST actions, form submissions
+    if any(sig in url_lower for sig in ("post", "submit", "form", "login", "upload", "send", "api/login", "api/submit")):
+        return "exfil_endpoint"
+
+    # Tracking pixels / analytics
+    if any(kw in url_lower for kw in _TRACKING_PIXEL_KEYWORDS):
+        return "tracking"
+
+    # CDN / static asset hosts
+    parsed = urlparse(url)
+    hostname = (parsed.hostname or "").lower()
+    if any(kw in hostname for kw in _CDN_KEYWORDS):
+        return "cdn"
+
+    # Redirect links (common redirect patterns in phishing)
+    if any(sig in url_lower for sig in ("redirect", "r/", "go/", "link/", "click", "jump", "redir")):
+        return "redirect"
+
+    return "resource"
+
+
+def _classify_domain_role(domain: str) -> str:
+    """Classify the role of a domain IOC.
+
+    Returns one of: cdn, tracking, resource.
+    """
+    domain_lower = domain.lower()
+
+    # Tracking / analytics domains
+    if any(kw in domain_lower for kw in _TRACKING_PIXEL_KEYWORDS):
+        return "tracking"
+
+    # CDN domains
+    if any(kw in domain_lower for kw in _CDN_KEYWORDS):
+        return "cdn"
+
+    return "resource"
+
+
+def _classify_role(ioc_type: str, value: str) -> str:
+    """Dispatch to the correct role classifier for a given IOC."""
+    if ioc_type == "url":
+        return _classify_url_role(value)
+    if ioc_type == "domain":
+        return _classify_domain_role(value)
+    # IPs, emails, telegram handles, wallets, phones default to resource
+    return "resource"
+
+
+# ---------------------------------------------------------------------------
+# Relationship helpers
+# ---------------------------------------------------------------------------
+
+
+def _is_script_src_url(url: str) -> bool:
+    """Heuristic: URL that looks like a script resource load."""
+    url_lower = url.lower()
+    return url_lower.endswith(".js") or ".js?" in url_lower or "script" in url_lower
+
+
+def _infer_context(ioc_type: str, value: str) -> str:
+    """Infer the HTML context in which this IOC was found."""
+    if ioc_type == "url":
+        url_lower = value.lower()
+        if url_lower.endswith(".js") or ".js?" in url_lower:
+            return "script"
+        if url_lower.endswith(".css") or ".css?" in url_lower:
+            return "link"
+        if any(sig in url_lower for sig in ("form", "submit", "login", "post")):
+            return "form"
+        return "link"
+    if ioc_type == "domain":
+        return "html"
+    if ioc_type == "email":
+        return "html"
+    if ioc_type == "telegram":
+        return "link"
+    return "html"
+
+
+# ---------------------------------------------------------------------------
+# Core service functions
+# ---------------------------------------------------------------------------
+
+
+def persist_iocs(
+    snapshot_id: str,
+    findings: dict,
+    session: Session,
+) -> dict:
+    """Persist IOC extraction results into the database.
+
+    For each IOC type in findings:
+      1. Create or merge IocModel rows (dedup by type+value via unique constraint
+         on IocModel.value).
+      2. Create IocOccurrenceModel rows linking each IOC to the snapshot.
+      3. Classify IOC roles based on value heuristics.
+      4. Build IocRelationshipModel rows: same_page (IOCs co-occurring in a
+         snapshot), script_load (script src URLs).
+
+    Args:
+        snapshot_id: The snapshot these IOCs were extracted from.
+        findings: Dict with keys like 'domains', 'ips', 'urls', 'emails',
+                  'telegram_handles', 'crypto_wallets', each mapping to list[str].
+        session: Active SQLAlchemy session.
+
+    Returns:
+        Dict with counts: {iocs_persisted, occurrences_created, relationships_created}.
+    """
+    from database import IocModel, IocOccurrenceModel, IocRelationshipModel
+
+    now = datetime.now(timezone.utc)
+
+    iocs_persisted = 0
+    occurrences_created = 0
+    relationships_created = 0
+
+    # Collect all IOC ids created/found in this run for same_page relationships.
+    snapshot_ioc_ids: list[int] = []
+
+    for findings_key, ioc_type in _IOC_TYPE_MAP.items():
+        values = findings.get(findings_key, [])
+        if not values:
+            continue
+
+        for value in values:
+            value = value.strip()
+            if not value:
+                continue
+
+            # Dedup: find existing or create new IocModel
+            existing = (
+                session.query(IocModel)
+                .filter(IocModel.value == value)
+                .first()
+            )
+
+            if existing is None:
+                ioc = IocModel(
+                    type=ioc_type,
+                    value=value,
+                    first_seen=now,
+                    last_seen=now,
+                )
+                session.add(ioc)
+                session.flush()  # assign ioc.id
+                iocs_persisted += 1
+                ioc_id = ioc.id
+            else:
+                # Update last_seen timestamp
+                existing.last_seen = now
+                ioc_id = existing.id
+
+            snapshot_ioc_ids.append(ioc_id)
+
+            # Create occurrence linking IOC to this snapshot
+            role = _classify_role(ioc_type, value)
+            context = _infer_context(ioc_type, value)
+
+            occurrence = IocOccurrenceModel(
+                ioc_id=ioc_id,
+                snapshot_id=snapshot_id,
+                context=context,
+                confidence=1.0,
+                role=role,
+                created_at=now,
+            )
+            session.add(occurrence)
+            occurrences_created += 1
+
+    # Build relationships -------------------------------------------------
+
+    # same_page: pairwise between all IOCs found in this snapshot
+    # Avoid creating duplicates by only creating (a,b) where a < b.
+    if len(snapshot_ioc_ids) >= 2:
+        sorted_ids = sorted(set(snapshot_ioc_ids))
+        for i in range(len(sorted_ids)):
+            for j in range(i + 1, len(sorted_ids)):
+                src_id = sorted_ids[i]
+                tgt_id = sorted_ids[j]
+
+                # Check if relationship already exists
+                exists = (
+                    session.query(IocRelationshipModel)
+                    .filter(
+                        IocRelationshipModel.source_ioc_id == src_id,
+                        IocRelationshipModel.target_ioc_id == tgt_id,
+                        IocRelationshipModel.relationship_type == "same_page",
+                    )
+                    .first()
+                )
+                if exists:
+                    continue
+
+                rel = IocRelationshipModel(
+                    source_ioc_id=src_id,
+                    target_ioc_id=tgt_id,
+                    relationship_type="same_page",
+                    confidence=0.7,
+                )
+                session.add(rel)
+                relationships_created += 1
+
+    # script_load: script src URLs are linked to the domain they are loaded on
+    url_ioc_ids = []
+    domain_ioc_ids = []
+    for ioc_id in snapshot_ioc_ids:
+        ioc = session.query(IocModel).get(ioc_id)
+        if ioc is None:
+            continue
+        if ioc.type == "url" and _is_script_src_url(ioc.value):
+            url_ioc_ids.append(ioc_id)
+        elif ioc.type == "domain":
+            domain_ioc_ids.append(ioc_id)
+
+    for url_id in url_ioc_ids:
+        url_ioc = session.query(IocModel).get(url_id)
+        if url_ioc is None:
+            continue
+        parsed = urlparse(url_ioc.value)
+        domain_host = (parsed.hostname or "").lower()
+        if not domain_host:
+            continue
+
+        for domain_id in domain_ioc_ids:
+            domain_ioc = session.query(IocModel).get(domain_id)
+            if domain_ioc is None:
+                continue
+            if domain_ioc.value.lower() == domain_host:
+                # Check if script_load relationship already exists
+                exists = (
+                    session.query(IocRelationshipModel)
+                    .filter(
+                        IocRelationshipModel.source_ioc_id == domain_id,
+                        IocRelationshipModel.target_ioc_id == url_id,
+                        IocRelationshipModel.relationship_type == "script_load",
+                    )
+                    .first()
+                )
+                if exists:
+                    continue
+
+                rel = IocRelationshipModel(
+                    source_ioc_id=domain_id,
+                    target_ioc_id=url_id,
+                    relationship_type="script_load",
+                    confidence=0.9,
+                )
+                session.add(rel)
+                relationships_created += 1
+
+    session.flush()
+
+    logger.info(
+        "persist_iocs snapshot=%s: %d iocs, %d occurrences, %d relationships",
+        snapshot_id,
+        iocs_persisted,
+        occurrences_created,
+        relationships_created,
+    )
+
+    return {
+        "iocs_persisted": iocs_persisted,
+        "occurrences_created": occurrences_created,
+        "relationships_created": relationships_created,
+    }
+
+
+def get_iocs_for_domain(
+    domain_id: str,
+    session: Session,
+) -> list[dict]:
+    """Return all IOCs found across all snapshots of a domain.
+
+    Joins ioc_occurrences -> snapshots -> domains to find every IOC that
+    appeared in any snapshot of the given domain.
+
+    Args:
+        domain_id: The domain to look up IOCs for.
+        session: Active SQLAlchemy session.
+
+    Returns:
+        List of dicts, each with ioc id, type, value, first_seen, last_seen,
+        snapshot_id, role, context, confidence.
+    """
+    from database import IocModel, IocOccurrenceModel, SnapshotModel
+
+    rows = (
+        session.query(
+            IocModel.id,
+            IocModel.type,
+            IocModel.value,
+            IocModel.first_seen,
+            IocModel.last_seen,
+            IocOccurrenceModel.snapshot_id,
+            IocOccurrenceModel.role,
+            IocOccurrenceModel.context,
+            IocOccurrenceModel.confidence,
+        )
+        .join(IocOccurrenceModel, IocModel.id == IocOccurrenceModel.ioc_id)
+        .join(SnapshotModel, IocOccurrenceModel.snapshot_id == SnapshotModel.id)
+        .filter(SnapshotModel.domain_id == domain_id)
+        .order_by(IocModel.type, IocModel.value)
+        .all()
+    )
+
+    results = []
+    for row in rows:
+        results.append({
+            "id": row.id,
+            "type": row.type,
+            "value": row.value,
+            "first_seen": row.first_seen.isoformat() if row.first_seen else None,
+            "last_seen": row.last_seen.isoformat() if row.last_seen else None,
+            "snapshot_id": row.snapshot_id,
+            "role": row.role,
+            "context": row.context,
+            "confidence": row.confidence,
+        })
+
+    logger.debug("get_iocs_for_domain domain=%s: %d results", domain_id, len(results))
+    return results
+
+
+def get_ioc_details(
+    ioc_id: int,
+    session: Session,
+) -> dict:
+    """Return an IOC with all its occurrences and related IOCs.
+
+    Args:
+        ioc_id: Primary key of the IocModel.
+        session: Active SQLAlchemy session.
+
+    Returns:
+        Dict with ioc details, list of occurrences, and list of related IOCs.
+        Returns empty dict if the IOC is not found.
+    """
+    from database import IocModel, IocOccurrenceModel, IocRelationshipModel
+
+    ioc = session.query(IocModel).get(ioc_id)
+    if ioc is None:
+        return {}
+
+    # Occurrences
+    occ_rows = (
+        session.query(IocOccurrenceModel)
+        .filter(IocOccurrenceModel.ioc_id == ioc_id)
+        .order_by(IocOccurrenceModel.created_at.desc())
+        .all()
+    )
+
+    occurrences = []
+    for occ in occ_rows:
+        occurrences.append({
+            "id": occ.id,
+            "snapshot_id": occ.snapshot_id,
+            "context": occ.context,
+            "confidence": occ.confidence,
+            "role": occ.role,
+            "created_at": occ.created_at.isoformat() if occ.created_at else None,
+        })
+
+    # Related IOCs (both directions of the relationship)
+    rel_rows = (
+        session.query(IocRelationshipModel)
+        .filter(
+            (IocRelationshipModel.source_ioc_id == ioc_id)
+            | (IocRelationshipModel.target_ioc_id == ioc_id)
+        )
+        .all()
+    )
+
+    related_iocs = []
+    seen_ioc_ids = set()
+    for rel in rel_rows:
+        # Determine the "other" IOC in this relationship
+        if rel.source_ioc_id == ioc_id:
+            other_id = rel.target_ioc_id
+        else:
+            other_id = rel.source_ioc_id
+
+        if other_id in seen_ioc_ids:
+            continue
+        seen_ioc_ids.add(other_id)
+
+        other_ioc = session.query(IocModel).get(other_id)
+        if other_ioc is None:
+            continue
+
+        related_iocs.append({
+            "id": other_ioc.id,
+            "type": other_ioc.type,
+            "value": other_ioc.value,
+            "relationship_type": rel.relationship_type,
+            "confidence": rel.confidence,
+        })
+
+    return {
+        "id": ioc.id,
+        "type": ioc.type,
+        "value": ioc.value,
+        "first_seen": ioc.first_seen.isoformat() if ioc.first_seen else None,
+        "last_seen": ioc.last_seen.isoformat() if ioc.last_seen else None,
+        "occurrences": occurrences,
+        "related_iocs": related_iocs,
+    }
+
+
+def search_iocs(
+    query: str,
+    ioc_type: Optional[str] = None,
+    session: Session = None,
+) -> list[dict]:
+    """Search IOCs by value substring with optional type filter.
+
+    Args:
+        query: Substring to search for in IOC values (case-insensitive).
+        ioc_type: Optional IOC type filter (domain, ip, url, email, telegram,
+                  wallet, phone).
+        session: Active SQLAlchemy session.
+
+    Returns:
+        List of dicts with ioc id, type, value, first_seen, last_seen, occurrence_count.
+    """
+    from database import IocModel, IocOccurrenceModel
+
+    q = session.query(
+        IocModel.id,
+        IocModel.type,
+        IocModel.value,
+        IocModel.first_seen,
+        IocModel.last_seen,
+        func.count(IocOccurrenceModel.id).label("occurrence_count"),
+    ).outerjoin(
+        IocOccurrenceModel, IocModel.id == IocOccurrenceModel.ioc_id
+    )
+
+    q = q.filter(IocModel.value.ilike(f"%{query}%"))
+
+    if ioc_type:
+        q = q.filter(IocModel.type == ioc_type)
+
+    q = q.group_by(IocModel.id).order_by(IocModel.value).limit(200)
+
+    rows = q.all()
+
+    results = []
+    for row in rows:
+        results.append({
+            "id": row.id,
+            "type": row.type,
+            "value": row.value,
+            "first_seen": row.first_seen.isoformat() if row.first_seen else None,
+            "last_seen": row.last_seen.isoformat() if row.last_seen else None,
+            "occurrence_count": row.occurrence_count,
+        })
+
+    logger.debug("search_iocs query=%r type=%s: %d results", query, ioc_type, len(results))
+    return results

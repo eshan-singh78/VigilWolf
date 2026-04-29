@@ -1,0 +1,106 @@
+version: "3.8"
+
+services:
+  backend:
+    build: ./backend
+    container_name: vigilwolf-backend
+    ports:
+      - "8000:8000"
+    environment:
+      PYTHONUNBUFFERED: "1"
+      MONITORING_DATA_DIR: /app/monitoring_data
+      DATABASE_URL: postgresql://vigilwolf:${POSTGRES_PASSWORD:-changeme}@postgres:5432/vigilwolf
+      API_KEY: ${API_KEY:-change-me-in-production}
+      ENVIRONMENT: production
+      ALLOWED_ORIGINS: http://localhost:3000,http://127.0.0.1:3000
+      RATE_LIMIT_PER_MINUTE: "60"
+      REDIS_URL: redis://redis:6379/0
+      DRAMATIQ_BROKER_URL: redis://redis:6379/0
+      ENABLE_PROMETHEUS: "true"
+      FORCE_HTTPS: "true"
+      TRUSTED_HOSTS: localhost,127.0.0.1
+      USE_DRAMATIQ_PIPELINE: "true"
+      ALERTS_DRY_RUN: "true"
+    volumes:
+      - backend-data:/app/monitoring_data
+    depends_on:
+      - postgres
+      - redis
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+    restart: unless-stopped
+
+  frontend:
+    build: ./frontend
+    container_name: vigilwolf-frontend
+    ports:
+      - "3000:3000"
+    environment:
+      BACKEND_URL: http://backend:8000
+      API_KEY: ${API_KEY:-change-me-in-production}
+    depends_on:
+      - backend
+    restart: unless-stopped
+
+  worker:
+    build: ./backend
+    container_name: vigilwolf-worker
+    command: dramatiq worker
+    environment:
+      PYTHONUNBUFFERED: "1"
+      MONITORING_DATA_DIR: /app/monitoring_data
+      DATABASE_URL: postgresql://vigilwolf:${POSTGRES_PASSWORD:-changeme}@postgres:5432/vigilwolf
+      API_KEY: ${API_KEY:-change-me-in-production}
+      ENVIRONMENT: production
+      ALLOWED_ORIGINS: http://localhost:3000,http://127.0.0.1:3000
+      RATE_LIMIT_PER_MINUTE: "60"
+      REDIS_URL: redis://redis:6379/0
+      DRAMATIQ_BROKER_URL: redis://redis:6379/0
+      ENABLE_PROMETHEUS: "true"
+      USE_DRAMATIQ_PIPELINE: "true"
+      ALERTS_DRY_RUN: "true"
+    volumes:
+      - backend-data:/app/monitoring_data
+    depends_on:
+      - postgres
+      - redis
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: vigilwolf-postgres
+    environment:
+      POSTGRES_DB: vigilwolf
+      POSTGRES_USER: vigilwolf
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-changeme}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U vigilwolf"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    container_name: vigilwolf-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    restart: unless-stopped
+
+volumes:
+  backend-data:
+    driver: local
+  postgres-data:
+    driver: local
+  redis-data:
+    driver: local

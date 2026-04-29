@@ -1,0 +1,385 @@
+"""Clustering service for VigilWolf v2.
+
+Groups domains into clusters based on HTML structural similarity and
+shared infrastructure signals.  Produces ClusterModel / ClusterMemberModel
+rows that downstream services (campaign detection, actor profiling) consume.
+"""
+from __future__ import annotations
+
+import hashlib
+import logging
+import uuid
+from collections import defaultdict
+from datetime import datetime, timezone
+from typing import Optional
+
+logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Structural-hash clustering
+# ---------------------------------------------------------------------------
+
+def cluster_by_structural_hash(session) -> dict:
+    """Cluster domains that share the same HTML structural hash.
+
+    Queries all html_hasher analysis results, groups by structural_hash,
+    and creates ClusterModel + ClusterMemberModel rows for groups of 2+
+    domains sharing the same hash.
+
+    Args:
+        session: SQLAlchemy session (caller is responsible for commit).
+
+    Returns:
+        Dict with clusters_created and domains_clustered counts.
+    """
+    from database import (  # type: ignore[import-untyped]
+        AnalysisResultModel,
+        ClusterMemberModel,
+        ClusterModel,
+        SnapshotModel,
+    )
+
+    # Collect all html_hasher analysis results.
+    results = (
+        session.query(AnalysisResultModel)
+        .filter(AnalysisResultModel.plugin_name == "html_hasher")
+        .all()
+    )
+
+    # Group domain_ids by structural_hash.
+    hash_groups: dict[str, list[str]] = defaultdict(list)
+    for result in results:
+        findings = result.result_json or {}
+        structural_hash = findings.get("structural_hash")
+        if not structural_hash:
+            continue
+
+        # Resolve the domain_id through the snapshot.
+        snapshot = session.query(SnapshotModel).get(result.snapshot_id)
+        if snapshot is None:
+            continue
+        domain_id = snapshot.domain_id
+
+        # Avoid duplicate domain entries within the same hash group.
+        if domain_id not in hash_groups[structural_hash]:
+            hash_groups[structural_hash].append(domain_id)
+
+    clusters_created = 0
+    domains_clustered = 0
+
+    for structural_hash, domain_ids in hash_groups.items():
+        if len(domain_ids) < 2:
+            continue
+
+        # Find or create the cluster.
+        cluster = (
+            session.query(ClusterModel)
+            .filter(
+                ClusterModel.cluster_type == "html_similarity",
+                ClusterModel.signature_hash == structural_hash,
+                ClusterModel.signature_type == "structural_hash",
+            )
+            .first()
+        )
+
+        if cluster is None:
+            cluster = ClusterModel(
+                id=str(uuid.uuid4()),
+                cluster_type="html_similarity",
+                signature_hash=structural_hash,
+                signature_type="structural_hash",
+                description=f"HTML structural similarity cluster ({structural_hash[:12]}...)",
+                domain_count=0,
+            )
+            session.add(cluster)
+            session.flush()  # ensure cluster.id is available
+            clusters_created += 1
+
+        # Add member domains (skip if already a member).
+        added = 0
+        for domain_id in domain_ids:
+            exists = (
+                session.query(ClusterMemberModel)
+                .filter(
+                    ClusterMemberModel.cluster_id == cluster.id,
+                    ClusterMemberModel.domain_id == domain_id,
+                )
+                .first()
+            )
+            if exists:
+                continue
+
+            member = ClusterMemberModel(
+                cluster_id=cluster.id,
+                domain_id=domain_id,
+                confidence=1.0,  # exact structural match
+            )
+            session.add(member)
+            added += 1
+
+        # Update cluster metadata.
+        if added:
+            cluster.domain_count = len(domain_ids)
+            cluster.last_seen = datetime.now(timezone.utc)
+            domains_clustered += added
+            logger.debug(
+                "Cluster %s: added %d domains (total %d)",
+                cluster.id, added, cluster.domain_count,
+            )
+
+    session.flush()
+    logger.info(
+        "Structural-hash clustering: %d clusters created, %d domains clustered",
+        clusters_created, domains_clustered,
+    )
+    return {"clusters_created": clusters_created, "domains_clustered": domains_clustered}
+
+
+# ---------------------------------------------------------------------------
+# Infrastructure clustering
+# ---------------------------------------------------------------------------
+
+def _build_infra_signature(domain_id: str, session) -> Optional[str]:
+    """Build an infrastructure signature tuple for a domain.
+
+    The signature is (asn, registrar, first NS record).  Returns None if
+    the domain has no IP records (cannot determine ASN).
+    """
+    from database import (  # type: ignore[import-untyped]
+        DomainIpModel,
+        DnsRecordModel,
+        DomainModel,
+    )
+
+    domain = session.query(DomainModel).get(domain_id)
+    if domain is None:
+        return None
+
+    # ASN: take from the first IP record that has one.
+    asn = None
+    ip_record = (
+        session.query(DomainIpModel)
+        .filter(DomainIpModel.domain_id == domain_id)
+        .order_by(DomainIpModel.first_seen)
+        .first()
+    )
+    if ip_record and hasattr(ip_record, "asn") and ip_record.asn:
+        asn = str(ip_record.asn)
+
+    # Registrar: stored on DomainProcessingState or domain meta.
+    # Fallback: check if DomainModel has registrar attribute.
+    registrar = getattr(domain, "registrar", None)
+
+    # First NS record.
+    ns_record = (
+        session.query(DnsRecordModel)
+        .filter(
+            DnsRecordModel.domain_id == domain_id,
+            DnsRecordModel.type == "NS",
+        )
+        .order_by(DnsRecordModel.first_seen)
+        .first()
+    )
+    first_ns = ns_record.value if ns_record else None
+
+    # Build signature.  We need ASN to produce a meaningful infra signature.
+    if asn is None and registrar is None and first_ns is None:
+        return None
+
+    return f"{asn or '_'}|{registrar or '_'}|{first_ns or '_'}"
+
+
+def cluster_by_infrastructure(session) -> dict:
+    """Cluster domains that share the same infrastructure signature.
+
+    Infrastructure signature = (asn, registrar, first NS record).
+    Domains with identical signatures are grouped into an infra cluster.
+
+    Args:
+        session: SQLAlchemy session (caller is responsible for commit).
+
+    Returns:
+        Dict with clusters_created and domains_clustered counts.
+    """
+    from database import (  # type: ignore[import-untyped]
+        ClusterMemberModel,
+        ClusterModel,
+        DomainModel,
+    )
+
+    # Build signatures for every domain.
+    domains = session.query(DomainModel).all()
+    sig_groups: dict[str, list[str]] = defaultdict(list)
+
+    for domain in domains:
+        sig = _build_infra_signature(domain.id, session)
+        if sig is None:
+            continue
+        sig_groups[sig].append(domain.id)
+
+    clusters_created = 0
+    domains_clustered = 0
+
+    for sig, domain_ids in sig_groups.items():
+        if len(domain_ids) < 2:
+            continue
+
+        # Derive a stable hash from the signature string.
+        sig_hash = hashlib.sha256(sig.encode("utf-8")).hexdigest()
+
+        # Find or create the cluster.
+        cluster = (
+            session.query(ClusterModel)
+            .filter(
+                ClusterModel.cluster_type == "infra",
+                ClusterModel.signature_hash == sig_hash,
+                ClusterModel.signature_type == "infra_signature",
+            )
+            .first()
+        )
+
+        if cluster is None:
+            cluster = ClusterModel(
+                id=str(uuid.uuid4()),
+                cluster_type="infra",
+                signature_hash=sig_hash,
+                signature_type="infra_signature",
+                description=f"Infrastructure cluster (ASN/registrar/NS: {sig})",
+                domain_count=0,
+                meta={"raw_signature": sig},
+            )
+            session.add(cluster)
+            session.flush()
+            clusters_created += 1
+
+        # Add member domains.
+        added = 0
+        for domain_id in domain_ids:
+            exists = (
+                session.query(ClusterMemberModel)
+                .filter(
+                    ClusterMemberModel.cluster_id == cluster.id,
+                    ClusterMemberModel.domain_id == domain_id,
+                )
+                .first()
+            )
+            if exists:
+                continue
+
+            member = ClusterMemberModel(
+                cluster_id=cluster.id,
+                domain_id=domain_id,
+                confidence=0.8,  # infra match is softer than structural hash
+            )
+            session.add(member)
+            added += 1
+
+        if added:
+            cluster.domain_count = len(domain_ids)
+            cluster.last_seen = datetime.now(timezone.utc)
+            domains_clustered += added
+            logger.debug(
+                "Infra cluster %s: added %d domains (total %d)",
+                cluster.id, added, cluster.domain_count,
+            )
+
+    session.flush()
+    logger.info(
+        "Infrastructure clustering: %d clusters created, %d domains clustered",
+        clusters_created, domains_clustered,
+    )
+    return {"clusters_created": clusters_created, "domains_clustered": domains_clustered}
+
+
+# ---------------------------------------------------------------------------
+# Read queries
+# ---------------------------------------------------------------------------
+
+def get_clusters_for_domain(domain_id: str, session) -> list[dict]:
+    """Return all clusters that contain the given domain.
+
+    Args:
+        domain_id: UUID of the domain.
+        session: SQLAlchemy session.
+
+    Returns:
+        List of dicts with cluster id, type, signature, description,
+        confidence, and joined_at.
+    """
+    from database import (  # type: ignore[import-untyped]
+        ClusterMemberModel,
+        ClusterModel,
+    )
+
+    rows = (
+        session.query(ClusterModel, ClusterMemberModel)
+        .join(ClusterMemberModel, ClusterModel.id == ClusterMemberModel.cluster_id)
+        .filter(ClusterMemberModel.domain_id == domain_id)
+        .all()
+    )
+
+    return [
+        {
+            "cluster_id": cluster.id,
+            "cluster_type": cluster.cluster_type,
+            "signature_hash": cluster.signature_hash,
+            "signature_type": cluster.signature_type,
+            "description": cluster.description,
+            "domain_count": cluster.domain_count,
+            "first_seen": cluster.first_seen.isoformat() if cluster.first_seen else None,
+            "last_seen": cluster.last_seen.isoformat() if cluster.last_seen else None,
+            "confidence": member.confidence,
+            "joined_at": member.joined_at.isoformat() if member.joined_at else None,
+        }
+        for cluster, member in rows
+    ]
+
+
+def get_cluster_details(cluster_id: str, session) -> Optional[dict]:
+    """Return full cluster details including all member domains.
+
+    Args:
+        cluster_id: UUID of the cluster.
+        session: SQLAlchemy session.
+
+    Returns:
+        Dict with cluster info and member list, or None if not found.
+    """
+    from database import (  # type: ignore[import-untyped]
+        ClusterMemberModel,
+        ClusterModel,
+        DomainModel,
+    )
+
+    cluster = session.query(ClusterModel).get(cluster_id)
+    if cluster is None:
+        return None
+
+    members = (
+        session.query(ClusterMemberModel, DomainModel)
+        .join(DomainModel, ClusterMemberModel.domain_id == DomainModel.id)
+        .filter(ClusterMemberModel.cluster_id == cluster_id)
+        .all()
+    )
+
+    return {
+        "id": cluster.id,
+        "cluster_type": cluster.cluster_type,
+        "signature_hash": cluster.signature_hash,
+        "signature_type": cluster.signature_type,
+        "description": cluster.description,
+        "domain_count": cluster.domain_count,
+        "first_seen": cluster.first_seen.isoformat() if cluster.first_seen else None,
+        "last_seen": cluster.last_seen.isoformat() if cluster.last_seen else None,
+        "meta": cluster.meta or {},
+        "members": [
+            {
+                "domain_id": domain.id,
+                "url": domain.url,
+                "confidence": member.confidence,
+                "joined_at": member.joined_at.isoformat() if member.joined_at else None,
+            }
+            for member, domain in members
+        ],
+    }

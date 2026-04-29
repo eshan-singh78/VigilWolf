@@ -1,0 +1,44 @@
+# Core Framework
+fastapi>=0.104.0
+uvicorn>=0.24.0
+pydantic>=2.0.0
+
+# HTTP and Web
+requests>=2.31.0
+httpx>=0.24.0
+beautifulsoup4>=4.12.0
+
+# Screenshot capture
+playwright>=1.40.0
+
+# Task Queue
+dramatiq[redis]>=1.15.0
+
+# Database
+sqlalchemy>=2.0.0
+alembic>=1.12.0
+psycopg2-binary>=2.9.0
+
+# Date/Time
+python-dateutil>=2.8.0
+
+# Existing VigilWolf Dependencies
+fuzzysearch
+python-whois
+dnspython>=2.4.0
+
+# Utilities
+python-dotenv>=1.0.0
+filelock>=3.13.0
+
+# Observability
+prometheus-client>=0.20.0
+
+# Caching / Rate Limiting
+redis>=5.0.0
+
+# Testing
+pytest>=7.4.0
+pytest-asyncio>=0.21.0
+pytest-cov>=4.1.0
+hypothesis>=6.92.0
