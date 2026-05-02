@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import threading as _threading
 import time as _time
 import uuid
 from datetime import datetime, timezone
@@ -27,6 +28,12 @@ from services.pipeline_metrics import pipeline_metrics
 import config
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Periodic reconciliation interval (seconds). Orphaned statuses are cleaned up
+# every RECONCILIATION_INTERVAL_S regardless of pipeline activity.
+# ---------------------------------------------------------------------------
+RECONCILIATION_INTERVAL_S = 15 * 60  # 15 minutes
 
 
 # ---------------------------------------------------------------------------
@@ -74,11 +81,88 @@ def _get_actors():
             html=html, snapshot_record=snapshot_record,
         )
 
+    @dramatiq.actor(broker=broker, max_retries=1, max_age=3600000, time_limit=120000)
+    def reconcile_orphaned_statuses():
+        """Periodic task to clean up orphaned pipeline statuses."""
+        run_periodic_reconciliation()
+
     _dramatiq_actors = {
         "capture_domain": capture_domain_actor,
         "build_context_and_analyze": build_context_and_analyze_actor,
+        "reconcile_orphaned_statuses": reconcile_orphaned_statuses,
     }
     return _dramatiq_actors
+
+
+# ---------------------------------------------------------------------------
+# Periodic orphan reconciliation
+# ---------------------------------------------------------------------------
+
+def run_periodic_reconciliation() -> dict:
+    """Synchronous reconciliation runner — manages its own DB session.
+
+    Called by the Dramatiq actor and by the background scheduler thread.
+    Returns the reconciliation result dict for logging.
+    """
+    logger.info("Starting periodic orphan status reconciliation")
+    try:
+        from database import get_session
+        from services.reconciliation_service import reconcile_orphaned_statuses
+
+        with get_session() as session:
+            result = reconcile_orphaned_statuses(session)
+            session.commit()
+
+        logger.info("Periodic reconciliation complete: %s", result)
+        return result
+    except Exception:
+        logger.exception("Periodic reconciliation failed")
+        return {"reconciled_running": 0, "reconciled_pending": 0, "error": True}
+
+
+_reconciliation_thread: Optional[_threading.Thread] = None
+
+
+def _reconciliation_scheduler_loop() -> None:
+    """Daemon thread that periodically enqueues reconciliation messages."""
+    # Wait briefly for the broker to be available before starting the loop.
+    _time.sleep(30)
+    while True:
+        try:
+            if config.USE_DRAMATIQ_PIPELINE:
+                actors = _get_actors()
+                actors["reconcile_orphaned_statuses"].send()
+            else:
+                # Sync mode — run directly in the background thread.
+                run_periodic_reconciliation()
+        except Exception:
+            logger.exception("Reconciliation scheduler error; will retry next interval")
+        _time.sleep(RECONCILIATION_INTERVAL_S)
+
+
+def start_periodic_reconciliation() -> None:
+    """Start the background reconciliation scheduler (idempotent).
+
+    Call once at worker startup.  The scheduler runs on a daemon thread so it
+    exits automatically when the main process stops.  If Dramatiq is enabled,
+    the scheduler sends a message to the ``reconcile_orphaned_statuses`` actor
+    every ``RECONCILIATION_INTERVAL_S`` seconds.  In sync mode it calls the
+    reconciliation function directly.
+    """
+    global _reconciliation_thread
+    if _reconciliation_thread is not None and _reconciliation_thread.is_alive():
+        logger.info("Periodic reconciliation scheduler already running; skipping.")
+        return
+
+    _reconciliation_thread = _threading.Thread(
+        target=_reconciliation_scheduler_loop,
+        name="vigilwolf-reconciliation-scheduler",
+        daemon=True,
+    )
+    _reconciliation_thread.start()
+    logger.info(
+        "Started periodic reconciliation scheduler (interval=%ds)", RECONCILIATION_INTERVAL_S,
+    )
 
 
 # ---------------------------------------------------------------------------
