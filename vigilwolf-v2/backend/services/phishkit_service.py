@@ -14,10 +14,12 @@ from __future__ import annotations
 import logging
 import uuid
 from collections import defaultdict
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Optional
 
 logger = logging.getLogger(__name__)
+
+PHISHKIT_WINDOW_DAYS = 30
 
 
 # ---------------------------------------------------------------------------
@@ -54,10 +56,23 @@ def detect_phishkits(session) -> dict:
         SnapshotPhishkitModel,
     )
 
-    # -- Step 1: collect all html_hasher results --------------------------------
+    # -- Step 1: collect recent html_hasher results ------------------------------
+    phishkit_cutoff = datetime.now(timezone.utc) - timedelta(days=PHISHKIT_WINDOW_DAYS)
+
+    # Only consider recent snapshots to avoid re-scanning the entire history.
+    recent_snapshot_ids = {
+        row.id
+        for row in session.query(SnapshotModel)
+        .filter(SnapshotModel.timestamp >= phishkit_cutoff)
+        .all()
+    }
+
     results = (
         session.query(AnalysisResultModel)
-        .filter(AnalysisResultModel.plugin_name == "html_hasher")
+        .filter(
+            AnalysisResultModel.plugin_name == "html_hasher",
+            AnalysisResultModel.snapshot_id.in_(recent_snapshot_ids),
+        )
         .all()
     )
 
@@ -78,7 +93,7 @@ def detect_phishkits(session) -> dict:
 
     # -- Step 3: process each group ---------------------------------------------
     for structural_hash, snapshot_ids in hash_to_snapshots.items():
-        if len(snapshot_ids) < 2:
+        if len(snapshot_ids) < 3:
             continue
 
         # Resolve domain_ids for all snapshots in this group (needed later for
@@ -97,44 +112,70 @@ def detect_phishkits(session) -> dict:
         )
 
         if phishkit is None:
-            phishkit = PhishkitModel(
-                id=str(uuid.uuid4()),
-                signature_hash=structural_hash,
-                meta={},
-                first_seen=datetime.now(timezone.utc),
-                last_seen=datetime.now(timezone.utc),
-            )
-            session.add(phishkit)
-            session.flush()  # ensure phishkit.id is available
-            phishkits_created += 1
-            logger.debug("Created phishkit %s (hash=%s)", phishkit.id, structural_hash[:12])
+            try:
+                with session.begin_nested():
+                    phishkit = PhishkitModel(
+                        id=str(uuid.uuid4()),
+                        signature_hash=structural_hash,
+                        meta={},
+                        first_seen=datetime.now(timezone.utc),
+                        last_seen=datetime.now(timezone.utc),
+                    )
+                    session.add(phishkit)
+                    session.flush()
+                phishkits_created += 1
+                logger.debug("Created phishkit %s (hash=%s)", phishkit.id, structural_hash[:12])
+            except Exception:
+                # Concurrent insert — look up the phishkit that was just created
+                phishkit = (
+                    session.query(PhishkitModel)
+                    .filter(PhishkitModel.signature_hash == structural_hash)
+                    .first()
+                )
+                if phishkit is None:
+                    logger.error("Phishkit lookup failed after IntegrityError for hash %s", structural_hash[:12])
+                    continue
+                # Defer last_seen update until we know whether new links were added.
         else:
-            phishkit.last_seen = datetime.now(timezone.utc)
-            phishkits_updated += 1
+            # Defer last_seen update and counter increment until we know
+            # whether any new links were actually created (see below).
+            pass
 
         # -- Link snapshots via SnapshotPhishkitModel --------------------------
         new_link_count = 0
         for sid in snapshot_ids:
-            existing_link = (
-                session.query(SnapshotPhishkitModel)
-                .filter(
-                    SnapshotPhishkitModel.snapshot_id == sid,
-                    SnapshotPhishkitModel.phishkit_id == phishkit.id,
+            try:
+                with session.begin_nested():
+                    existing_link = (
+                        session.query(SnapshotPhishkitModel)
+                        .filter(
+                            SnapshotPhishkitModel.snapshot_id == sid,
+                            SnapshotPhishkitModel.phishkit_id == phishkit.id,
+                        )
+                        .first()
+                    )
+                    if existing_link is not None:
+                        continue
+                    link = SnapshotPhishkitModel(
+                        snapshot_id=sid,
+                        phishkit_id=phishkit.id,
+                        similarity=1.0,  # exact structural hash match
+                    )
+                    session.add(link)
+                    session.flush()
+                new_link_count += 1
+            except Exception:
+                logger.debug(
+                    "Snapshot-phishkit link already exists: snapshot=%s phishkit=%s",
+                    sid[:8], phishkit.id[:8],
                 )
-                .first()
-            )
-            if existing_link is not None:
-                continue
-
-            link = SnapshotPhishkitModel(
-                snapshot_id=sid,
-                phishkit_id=phishkit.id,
-                similarity=1.0,  # exact structural hash match
-            )
-            session.add(link)
-            new_link_count += 1
 
         snapshots_linked += new_link_count
+
+        # Only update last_seen and count as "updated" when new data was added.
+        if new_link_count > 0:
+            phishkit.last_seen = datetime.now(timezone.utc)
+            phishkits_updated += 1
 
         # -- Enrich exfil_endpoint from ioc_extractor --------------------------
         if phishkit.exfil_endpoint is None:
@@ -246,44 +287,67 @@ def _upsert_phishkit_cluster(
     )
 
     if cluster is None:
-        cluster = ClusterModel(
-            id=str(uuid.uuid4()),
-            cluster_type="phishkit",
-            signature_hash=structural_hash,
-            signature_type="structural_hash",
-            description=f"Phishkit cluster (structural_hash {structural_hash[:12]}...)",
-            domain_count=0,
-        )
-        session.add(cluster)
-        session.flush()
-        logger.debug("Created phishkit cluster %s", cluster.id)
+        try:
+            with session.begin_nested():
+                cluster = ClusterModel(
+                    id=str(uuid.uuid4()),
+                    cluster_type="phishkit",
+                    signature_hash=structural_hash,
+                    signature_type="structural_hash",
+                    description=f"Phishkit cluster (structural_hash {structural_hash[:12]}...)",
+                    domain_count=0,
+                )
+                session.add(cluster)
+                session.flush()
+            logger.debug("Created phishkit cluster %s", cluster.id)
+        except Exception:
+            # Concurrent insert — look up the cluster that was just created
+            cluster = (
+                session.query(ClusterModel)
+                .filter(
+                    ClusterModel.cluster_type == "phishkit",
+                    ClusterModel.signature_hash == structural_hash,
+                    ClusterModel.signature_type == "structural_hash",
+                )
+                .first()
+            )
+            if cluster is None:
+                logger.error("Cluster lookup failed after IntegrityError for phishkit hash %s", structural_hash[:12])
+                return
 
     # Collect unique domain_ids from the snapshot-domain mapping.
     domain_ids = list(set(snapshot_domain_map.values()))
 
     added = 0
     for domain_id in domain_ids:
-        exists = (
-            session.query(ClusterMemberModel)
-            .filter(
-                ClusterMemberModel.cluster_id == cluster.id,
-                ClusterMemberModel.domain_id == domain_id,
+        try:
+            with session.begin_nested():
+                exists = (
+                    session.query(ClusterMemberModel)
+                    .filter(
+                        ClusterMemberModel.cluster_id == cluster.id,
+                        ClusterMemberModel.domain_id == domain_id,
+                    )
+                    .first()
+                )
+                if exists is not None:
+                    continue
+                member = ClusterMemberModel(
+                    cluster_id=cluster.id,
+                    domain_id=domain_id,
+                    confidence=1.0,  # exact structural hash match
+                )
+                session.add(member)
+                session.flush()
+            added += 1
+        except Exception:
+            logger.debug(
+                "Cluster member already exists: cluster=%s domain=%s",
+                cluster.id[:8], domain_id[:8],
             )
-            .first()
-        )
-        if exists is not None:
-            continue
-
-        member = ClusterMemberModel(
-            cluster_id=cluster.id,
-            domain_id=domain_id,
-            confidence=1.0,  # exact structural hash match
-        )
-        session.add(member)
-        added += 1
 
     if added:
-        cluster.domain_count = len(domain_ids)
+        cluster.domain_count += added
         cluster.last_seen = datetime.now(timezone.utc)
 
 
