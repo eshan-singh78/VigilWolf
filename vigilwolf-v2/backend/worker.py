@@ -360,25 +360,11 @@ def capture_domain(domain_id: str, url: str, trigger_type: str = "nrd_ingest") -
         # Step 2 — SHA-256
         sha256 = hashlib.sha256(html.encode("utf-8", errors="replace")).hexdigest()
 
-        # Step 3 — Duplicate check
-        from database import get_session, SnapshotModel as _SnapshotModel
+        # Step 3 — Duplicate check & snapshot insert (single session to prevent race)
+        from database import get_session, SnapshotModel
+        from sqlalchemy.exc import IntegrityError
 
-        with get_session() as session:
-            existing = (
-                session.query(_SnapshotModel)
-                .filter_by(domain_id=domain_id, sha256=sha256)
-                .first()
-            )
-            if existing:
-                logger.info(
-                    "Duplicate snapshot for domain_id=%s sha256=%s; skipping.",
-                    domain_id, sha256[:12],
-                )
-                return existing.id
-
-        # Step 4 — Save to storage & create SnapshotModel
-        from database import get_session as _get_session, SnapshotModel
-
+        # Step 3a — Save to storage (file I/O, outside DB session)
         snapshot_id = str(uuid.uuid4())
         snapshot_record_dict = {
             "id": snapshot_id,
@@ -402,18 +388,51 @@ def capture_domain(domain_id: str, url: str, trigger_type: str = "nrd_ingest") -
         if config.ENVIRONMENT == "production" and not html_path:
             raise RuntimeError("storage_manager returned empty html_path in production")
 
-        with _get_session() as session:
-            snapshot = SnapshotModel(
-                id=snapshot_id,
-                domain_id=domain_id,
-                timestamp=datetime.now(timezone.utc),
-                trigger_type=trigger_type,
-                html_path=html_path,
-                sha256=sha256,
-                size_bytes=len(html.encode("utf-8", errors="replace")),
-                success=True,
+        # Step 3b — Duplicate check + insert in one session (prevents race condition
+        # where a concurrent worker inserts the same snapshot between the check and
+        # the insert, causing a silent IntegrityError loss)
+        with get_session() as session:
+            existing = (
+                session.query(SnapshotModel)
+                .filter_by(domain_id=domain_id, sha256=sha256)
+                .first()
             )
-            session.add(snapshot)
+            if existing:
+                logger.info(
+                    "Duplicate snapshot for domain_id=%s sha256=%s; skipping.",
+                    domain_id, sha256[:12],
+                )
+                return existing.id
+
+            try:
+                with session.begin_nested():
+                    snapshot = SnapshotModel(
+                        id=snapshot_id,
+                        domain_id=domain_id,
+                        timestamp=datetime.now(timezone.utc),
+                        trigger_type=trigger_type,
+                        html_path=html_path,
+                        sha256=sha256,
+                        size_bytes=len(html.encode("utf-8", errors="replace")),
+                        success=True,
+                    )
+                    session.add(snapshot)
+                    session.flush()
+            except IntegrityError:
+                # Concurrent insert won the race — look up the existing snapshot
+                existing = (
+                    session.query(SnapshotModel)
+                    .filter_by(domain_id=domain_id, sha256=sha256)
+                    .first()
+                )
+                if existing:
+                    logger.info(
+                        "Race condition: duplicate snapshot for domain_id=%s sha256=%s; returning existing.",
+                        domain_id, sha256[:12],
+                    )
+                    return existing.id
+                raise
+
             session.commit()
 
         # Step 5 — Build context and analyze (sync or Dramatiq)

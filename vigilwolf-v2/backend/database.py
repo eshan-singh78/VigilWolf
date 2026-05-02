@@ -611,6 +611,7 @@ def get_engine():
     is_memory = db_url == "sqlite:///:memory:"
 
     kwargs: dict = {}
+    kwargs["pool_pre_ping"] = True
     if is_sqlite:
         kwargs["connect_args"] = {"check_same_thread": False}
     if is_memory:

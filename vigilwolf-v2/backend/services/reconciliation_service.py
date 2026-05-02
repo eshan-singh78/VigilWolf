@@ -12,7 +12,7 @@ from datetime import datetime, timezone, timedelta
 logger = logging.getLogger(__name__)
 
 # Plugins left in "running" status for longer than this are considered orphaned.
-ORPHANED_THRESHOLD_MINUTES = 30
+ORPHANED_THRESHOLD_MINUTES = 5
 
 
 def reconcile_orphaned_statuses(session) -> dict:
