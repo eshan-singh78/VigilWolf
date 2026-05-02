@@ -16,7 +16,6 @@ from typing import Optional
 from urllib.parse import urlparse
 
 from sqlalchemy import func, or_
-from sqlalchemy.exc import IntegrityError
 
 logger = logging.getLogger(__name__)
 
@@ -34,6 +33,7 @@ CAMPAIGN_RECHECK_INTERVAL_HOURS = 24
 _BRAND_DENYLIST = {
     "google", "cloudflare", "akamai", "amazon", "aws", "azure",
     "microsoft", "apple", "github", "gitlab", "docker",
+    "icloud", "citi",
     "npm", "jsdelivr", "unpkg", "cdnjs",
     "go", "me", "it", "be", "at", "us", "uk", "de", "fr",
     "my", "tv", "io", "ai", "co",
@@ -41,6 +41,16 @@ _BRAND_DENYLIST = {
 
 # Minimum keyword length — keywords shorter than 4 chars match too broadly.
 _BRAND_MIN_LENGTH = 4
+
+# Known legitimate infrastructure domains that must never be used for brand
+# detection.  These are real domains owned by the brands they reference, so
+# matching them would produce false campaigns.
+_LEGITIMATE_DOMAIN_DENYLIST = {
+    "apple.com", "icloud.com", "usps.com", "dhl.com", "fedex.com",
+    "ups.com", "google.com", "microsoft.com", "amazon.com",
+    "netflix.com", "linkedin.com", "facebook.com", "twitter.com",
+    "x.com", "stripe.com", "shopify.com",
+}
 
 # Ordered by specificity — longer keywords first to avoid partial matches.
 BRAND_KEYWORDS: list[tuple[str, str]] = [
@@ -127,6 +137,11 @@ def _detect_brand(domain_urls: list[str]) -> Optional[str]:
         except Exception:
             continue
 
+    if not hostnames:
+        return None
+
+    # Exclude known legitimate infrastructure domains before brand matching.
+    hostnames = [h for h in hostnames if h not in _LEGITIMATE_DOMAIN_DENYLIST]
     if not hostnames:
         return None
 
@@ -353,25 +368,12 @@ def detect_campaigns(session) -> dict:
                 continue
 
             campaign_name = _generate_campaign_name(brand)
-
-            # Ensure name uniqueness — append a short suffix if collision.
-            name = campaign_name
-            suffix = 1
-            while (
-                session.query(CampaignModel)
-                .filter(CampaignModel.name == name)
-                .first()
-                is not None
-            ):
-                name = f"{campaign_name}_{suffix}"
-                suffix += 1
-
             campaign_id = str(uuid.uuid4())
             try:
                 with session.begin_nested():
                     campaign = CampaignModel(
                         id=campaign_id,
-                        name=name,
+                        name=campaign_name,
                         target_brand=brand,
                         first_seen=cluster.first_seen,
                         last_seen=cluster.last_seen,
@@ -381,7 +383,7 @@ def detect_campaigns(session) -> dict:
                         meta={"source_cluster_type": cluster.cluster_type},
                     )
                     session.add(campaign)
-                    session.flush()  # ensure campaign.id is available
+                    session.flush()
 
                     # Link the cluster to the campaign.
                     link = CampaignClusterModel(
@@ -398,23 +400,35 @@ def detect_campaigns(session) -> dict:
                     "Created campaign %s (%s): brand=%s, domain_count=%d",
                     campaign.id, campaign.name, brand, campaign.domain_count,
                 )
-            except IntegrityError:
-                # Concurrent worker beat us to this campaign name — look it up instead.
+            except Exception:
+                # Concurrent insert — look up the campaign that was just created.
                 campaign = (
                     session.query(CampaignModel)
-                    .filter(CampaignModel.name == name)
+                    .filter(CampaignModel.name == campaign_name)
                     .first()
                 )
                 if campaign is None:
                     logger.error(
-                        "IntegrityError on campaign name %s but lookup returned None; skipping.",
-                        name,
+                        "Campaign lookup failed after IntegrityError for name %s",
+                        campaign_name,
                     )
                     continue
-                logger.info(
-                    "Campaign %s (%s) already existed (concurrent create); re-using.",
-                    campaign.id, campaign.name,
-                )
+                # The campaign exists now — link the cluster to it.
+                try:
+                    with session.begin_nested():
+                        link = CampaignClusterModel(
+                            campaign_id=campaign.id,
+                            cluster_id=cluster.id,
+                        )
+                        session.add(link)
+                        session.flush()
+                    _recompute_domain_count(campaign, session)
+                    campaigns_updated += 1
+                except Exception:
+                    logger.debug(
+                        "Cluster %s already linked to campaign %s",
+                        cluster.id[:8], campaign.id[:8],
+                    )
 
     for cluster in clusters:
         cluster.last_campaign_check = datetime.now(timezone.utc)
