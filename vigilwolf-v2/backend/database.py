@@ -400,6 +400,7 @@ class IocModel(Base):
     __tablename__ = "iocs"
     __table_args__ = (
         UniqueConstraint("value_hash", name="uq_ioc_value_hash"),
+        Index("ix_ioc_value", "value"),  # helps with prefix/exact matches
     )
 
     id = Column(Integer, primary_key=True, autoincrement=True)
@@ -462,7 +463,7 @@ class ClusterModel(Base):
     signature_type = Column(String(30), nullable=False)  # structural_hash, infra_signature, js_hash
     description = Column(Text, nullable=True)
     first_seen = Column(DateTime, default=utc_now, nullable=False)
-    last_seen = Column(DateTime, default=utc_now, nullable=False, onupdate=utc_now)
+    last_seen = Column(DateTime, default=utc_now, nullable=False)
     domain_count = Column(Integer, default=0)
     last_campaign_check = Column(DateTime(timezone=True), nullable=True)
     meta = Column(JSON, default=dict)
@@ -503,7 +504,7 @@ class PhishkitModel(Base):
     exfil_endpoint = Column(Text, nullable=True)
     meta = Column(JSON, default=dict)
     first_seen = Column(DateTime, default=utc_now, nullable=False)
-    last_seen = Column(DateTime, default=utc_now, nullable=False, onupdate=utc_now)
+    last_seen = Column(DateTime, default=utc_now, nullable=False)
 
 
 class SnapshotPhishkitModel(Base):
