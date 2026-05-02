@@ -15,10 +15,16 @@ from datetime import datetime, timezone, timedelta
 from typing import Optional
 from urllib.parse import urlparse
 
-from sqlalchemy import func
+from sqlalchemy import func, or_
 from sqlalchemy.exc import IntegrityError
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Recheck interval
+# ---------------------------------------------------------------------------
+
+CAMPAIGN_RECHECK_INTERVAL_HOURS = 24
 
 # ---------------------------------------------------------------------------
 # Brand detection
@@ -217,14 +223,20 @@ def detect_campaigns(session) -> dict:
     )
 
     cutoff = datetime.now(timezone.utc) - timedelta(days=DETECTION_WINDOW_DAYS)
+    recheck_cutoff = datetime.now(timezone.utc) - timedelta(hours=CAMPAIGN_RECHECK_INTERVAL_HOURS)
 
-    # Find qualifying clusters: html_similarity, 3+ domains, within window.
+    # Find qualifying clusters: html_similarity, 3+ domains, within window,
+    # and not already checked within the recheck interval.
     clusters = (
         session.query(ClusterModel)
         .filter(
             ClusterModel.cluster_type == "html_similarity",
             ClusterModel.domain_count >= 3,
             ClusterModel.last_seen >= cutoff,
+            or_(
+                ClusterModel.last_campaign_check.is_(None),
+                ClusterModel.last_campaign_check < recheck_cutoff,
+            ),
         )
         .all()
     )
@@ -337,6 +349,7 @@ def detect_campaigns(session) -> dict:
                     "Linked cluster %s to existing campaign %s (brand=%s)",
                     cluster.id[:8], existing_brand_campaign.id[:8], brand,
                 )
+                cluster.last_campaign_check = datetime.now(timezone.utc)
                 continue
 
             campaign_name = _generate_campaign_name(brand)
@@ -402,6 +415,9 @@ def detect_campaigns(session) -> dict:
                     "Campaign %s (%s) already existed (concurrent create); re-using.",
                     campaign.id, campaign.name,
                 )
+
+    for cluster in clusters:
+        cluster.last_campaign_check = datetime.now(timezone.utc)
 
     session.flush()
     logger.info(

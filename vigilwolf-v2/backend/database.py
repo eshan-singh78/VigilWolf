@@ -464,6 +464,7 @@ class ClusterModel(Base):
     first_seen = Column(DateTime, default=utc_now, nullable=False)
     last_seen = Column(DateTime, default=utc_now, nullable=False, onupdate=utc_now)
     domain_count = Column(Integer, default=0)
+    last_campaign_check = Column(DateTime(timezone=True), nullable=True)
     meta = Column(JSON, default=dict)
 
     members = relationship("ClusterMemberModel", back_populates="cluster", lazy="dynamic")
