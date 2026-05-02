@@ -537,6 +537,14 @@ def orchestrate_analysis(ctx: SnapshotContext) -> None:
         # Increment Prometheus counter for domains processed
         _inc_domains_processed()
 
+        # Enqueue intelligence pipeline (clustering, campaigns, phishkits, actors)
+        if config.INTELLIGENCE_PIPELINE_ENABLED:
+            try:
+                from intelligence_worker import enqueue_intelligence_pipeline
+                enqueue_intelligence_pipeline(ctx.snapshot_id)
+            except Exception:
+                logger.exception("Failed to enqueue intelligence pipeline for snapshot_id=%s", ctx.snapshot_id)
+
         # Record pipeline success metric
         pipeline_metrics.record_success(_time.time() - _start)
 
