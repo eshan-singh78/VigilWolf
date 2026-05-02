@@ -583,7 +583,7 @@ class C2CandidateModel(Base):
     """A C2 candidate identified by the intelligence pipeline."""
     __tablename__ = "c2_candidates"
     __table_args__ = (
-        UniqueConstraint("ioc_id", "snapshot_id", name="uq_c2_candidate_snapshot"),
+        UniqueConstraint("ioc_id", name="uq_c2_candidate_ioc"),
     )
 
     id = Column(Integer, primary_key=True, autoincrement=True)

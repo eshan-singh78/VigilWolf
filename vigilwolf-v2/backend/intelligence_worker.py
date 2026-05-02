@@ -174,12 +174,24 @@ def run_intelligence_pipeline(snapshot_id: str) -> Optional[dict]:
             from services.c2_service import rank_c2_candidates  # type: ignore[import-untyped]
 
             with get_session() as session:
-                c2_result = rank_c2_candidates(session)
+                c2_result = rank_c2_candidates(session, snapshot_id=snapshot_id)
                 if c2_result:
-                    # Persist top C2 candidates
                     for candidate in c2_result:
                         try:
                             with session.begin_nested():
+                                # Check if this IOC already has a C2 candidate
+                                existing = (
+                                    session.query(C2CandidateModel)
+                                    .filter(C2CandidateModel.ioc_id == candidate["ioc_id"])
+                                    .first()
+                                )
+                                if existing:
+                                    # Update score if new score is higher
+                                    if candidate["c2_score"] > existing.c2_score:
+                                        existing.c2_score = candidate["c2_score"]
+                                        existing.signals = candidate.get("signals", [])
+                                        existing.snapshot_id = snapshot_id
+                                    continue
                                 c2_row = C2CandidateModel(
                                     ioc_id=candidate["ioc_id"],
                                     snapshot_id=snapshot_id,

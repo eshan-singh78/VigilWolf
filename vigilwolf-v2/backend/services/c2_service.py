@@ -51,8 +51,7 @@ def _is_post_form_target(ioc_value: str, ioc_type: str) -> bool:
     lower = ioc_value.lower()
     indicators = (
         "post", "submit", "login", "form", "upload", "send",
-        "api/login", "api/submit", "process", "verify", "check",
-        "action", "capture", "collect", "exfil",
+        "api/login", "api/submit", "capture", "collect", "exfil",
     )
     return any(sig in lower for sig in indicators)
 
@@ -62,7 +61,7 @@ def _is_post_form_target(ioc_value: str, ioc_type: str) -> bool:
 # ---------------------------------------------------------------------------
 
 
-def _bulk_preload_signals(ioc_ids: list[int], session) -> tuple[dict[int, int], set[int], dict[int, str]]:
+def _bulk_preload_signals(ioc_ids: list[int], session, cutoff: datetime | None = None) -> tuple[dict[int, int], set[int], dict[int, str]]:
     """Bulk-pre-load C2 signals for all IOCs at once.
 
     Returns three structures that replace the old per-IOC queries:
@@ -79,29 +78,32 @@ def _bulk_preload_signals(ioc_ids: list[int], session) -> tuple[dict[int, int], 
     from sqlalchemy import func as sa_func
 
     # 1. Domain counts per IOC: join occurrences -> snapshots -> domains, count distinct domains
-    domain_count_rows = (
+    query = (
         session.query(
             IocOccurrenceModel.ioc_id,
             sa_func.count(sa_func.distinct(SnapshotModel.domain_id)),
         )
         .join(SnapshotModel, SnapshotModel.id == IocOccurrenceModel.snapshot_id)
         .filter(IocOccurrenceModel.ioc_id.in_(ioc_ids))
-        .group_by(IocOccurrenceModel.ioc_id)
-        .all()
     )
+    if cutoff is not None:
+        query = query.filter(SnapshotModel.timestamp >= cutoff)
+    domain_count_rows = query.group_by(IocOccurrenceModel.ioc_id).all()
     ioc_domain_count: dict[int, int] = {row[0]: row[1] for row in domain_count_rows}
 
     # 2. Phishkit linkage: find all snapshot_ids linked to phishkits, then find which ioc_ids
     #    appear in those snapshots.
     # First, get all snapshot_ids that contain any of our IOCs.
-    occ_snapshot_rows = (
+    query = (
         session.query(
             IocOccurrenceModel.ioc_id,
             IocOccurrenceModel.snapshot_id,
         )
         .filter(IocOccurrenceModel.ioc_id.in_(ioc_ids))
-        .all()
     )
+    if cutoff is not None:
+        query = query.join(SnapshotModel, IocOccurrenceModel.snapshot_id == SnapshotModel.id).filter(SnapshotModel.timestamp >= cutoff)
+    occ_snapshot_rows = query.all()
     # Map snapshot_id -> set of ioc_ids for fast lookup
     snapshot_to_ioc_ids: dict[str, set[int]] = defaultdict(set)
     all_snapshot_ids: set[str] = set()
@@ -124,14 +126,16 @@ def _bulk_preload_signals(ioc_ids: list[int], session) -> tuple[dict[int, int], 
     # 3. IOC roles: get the role from IocOccurrenceModel for each ioc_id.
     #    If an IOC has multiple occurrences with different roles, prefer
     #    'exfil_endpoint' over others (it is the strongest C2 signal).
-    role_rows = (
+    query = (
         session.query(
             IocOccurrenceModel.ioc_id,
             IocOccurrenceModel.role,
         )
         .filter(IocOccurrenceModel.ioc_id.in_(ioc_ids))
-        .all()
     )
+    if cutoff is not None:
+        query = query.join(SnapshotModel, IocOccurrenceModel.snapshot_id == SnapshotModel.id).filter(SnapshotModel.timestamp >= cutoff)
+    role_rows = query.all()
     ioc_roles: dict[int, str] = {}
     for row in role_rows:
         ioc_id = row.ioc_id
@@ -149,7 +153,7 @@ def _bulk_preload_signals(ioc_ids: list[int], session) -> tuple[dict[int, int], 
 # ---------------------------------------------------------------------------
 
 
-def rank_c2_candidates(session) -> list[dict]:
+def rank_c2_candidates(session, snapshot_id: str | None = None) -> list[dict]:
     """Scan IOCs for C2 indicators and return a ranked list of candidates.
 
     Each IOC is scored across four signals:
@@ -194,7 +198,7 @@ def rank_c2_candidates(session) -> list[dict]:
 
     # Bulk pre-load all C2 signals in 3 queries instead of 3 per IOC.
     ioc_ids = [ioc.id for ioc in iocs]
-    ioc_domain_count, ioc_has_phishkit, ioc_roles = _bulk_preload_signals(ioc_ids, session)
+    ioc_domain_count, ioc_has_phishkit, ioc_roles = _bulk_preload_signals(ioc_ids, session, cutoff=cutoff)
 
     candidates: list[dict] = []
 
@@ -225,13 +229,16 @@ def rank_c2_candidates(session) -> list[dict]:
 
         # Only include IOCs with at least one signal.
         if score > 0.0:
-            candidates.append({
+            candidate: dict = {
                 "ioc_id": ioc.id,
                 "ioc_type": ioc.type,
                 "ioc_value": ioc.value,
                 "c2_score": round(score, 4),
                 "signals": signals,
-            })
+            }
+            if snapshot_id is not None:
+                candidate["snapshot_id"] = snapshot_id
+            candidates.append(candidate)
 
     # Sort by c2_score descending, break ties by ioc_id for determinism.
     candidates.sort(key=lambda c: (-c["c2_score"], c["ioc_id"]))
