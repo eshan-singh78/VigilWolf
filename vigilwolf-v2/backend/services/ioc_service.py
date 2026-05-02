@@ -145,7 +145,7 @@ def _classify_url_role(url: str) -> str:
         return "resource"
 
     # Exfiltration endpoints: POST actions, form submissions
-    if any(sig in url_lower for sig in ("post", "submit", "form", "login", "upload", "send", "api/login", "api/submit")):
+    if any(sig in url_lower for sig in ("post", "submit", "upload", "send", "api/login", "api/submit", "capture", "collect", "exfil")):
         return "exfil_endpoint"
 
     # Tracking pixels / analytics
