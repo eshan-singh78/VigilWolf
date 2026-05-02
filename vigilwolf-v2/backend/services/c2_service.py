@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import logging
 from collections import defaultdict
-from typing import Optional
+from datetime import datetime, timedelta, timezone
 
 logger = logging.getLogger(__name__)
 
@@ -26,6 +26,9 @@ MULTI_DOMAIN_THRESHOLD = 5
 
 # Maximum number of candidates to return.
 MAX_CANDIDATES = 50
+
+# Only consider IOCs seen within this many days for C2 ranking.
+C2_WINDOW_DAYS = 30
 
 
 # ---------------------------------------------------------------------------
@@ -50,76 +53,91 @@ def _is_post_form_target(ioc_value: str, ioc_type: str) -> bool:
     return any(sig in lower for sig in indicators)
 
 
-def _is_phishkit_linked(ioc_id: int, session) -> bool:
-    """Check if an IOC occurs in a snapshot linked to a phishkit.
-
-    Joins IocOccurrenceModel -> SnapshotModel -> SnapshotPhishkitModel to
-    determine whether any snapshot containing this IOC also has a phishkit
-    association.
-    """
-    from database import (  # type: ignore[import-untyped]
-        IocOccurrenceModel,
-        SnapshotPhishkitModel,
-    )
-
-    occ_rows = (
-        session.query(IocOccurrenceModel.snapshot_id)
-        .filter(IocOccurrenceModel.ioc_id == ioc_id)
-        .all()
-    )
-    snapshot_ids = [row.snapshot_id for row in occ_rows]
-    if not snapshot_ids:
-        return False
-
-    phishkit_link = (
-        session.query(SnapshotPhishkitModel)
-        .filter(SnapshotPhishkitModel.snapshot_id.in_(snapshot_ids))
-        .first()
-    )
-    return phishkit_link is not None
+# ---------------------------------------------------------------------------
+# Bulk signal pre-loading helpers
+# ---------------------------------------------------------------------------
 
 
-def _domain_count_for_ioc(ioc_id: int, session) -> int:
-    """Count the number of distinct domains an IOC appears across.
+def _bulk_preload_signals(ioc_ids: list[int], session) -> tuple[dict[int, int], set[int], dict[int, str]]:
+    """Bulk-pre-load C2 signals for all IOCs at once.
 
-    Joins IocOccurrenceModel -> SnapshotModel -> DomainModel to count
-    unique domains.
+    Returns three structures that replace the old per-IOC queries:
+      - ioc_domain_count: maps ioc_id -> count of distinct domains
+      - ioc_has_phishkit: set of ioc_ids linked to phishkit snapshots
+      - ioc_roles: maps ioc_id -> its role (from IocOccurrenceModel)
     """
     from database import (  # type: ignore[import-untyped]
         DomainModel,
         IocOccurrenceModel,
         SnapshotModel,
+        SnapshotPhishkitModel,
     )
+    from sqlalchemy import func as sa_func
 
-    rows = (
-        session.query(DomainModel.id)
-        .join(SnapshotModel, SnapshotModel.domain_id == DomainModel.id)
-        .join(IocOccurrenceModel, IocOccurrenceModel.snapshot_id == SnapshotModel.id)
-        .filter(IocOccurrenceModel.ioc_id == ioc_id)
-        .distinct()
+    # 1. Domain counts per IOC: join occurrences -> snapshots -> domains, count distinct domains
+    domain_count_rows = (
+        session.query(
+            IocOccurrenceModel.ioc_id,
+            sa_func.count(sa_func.distinct(SnapshotModel.domain_id)),
+        )
+        .join(SnapshotModel, SnapshotModel.id == IocOccurrenceModel.snapshot_id)
+        .filter(IocOccurrenceModel.ioc_id.in_(ioc_ids))
+        .group_by(IocOccurrenceModel.ioc_id)
         .all()
     )
-    return len(rows)
+    ioc_domain_count: dict[int, int] = {row[0]: row[1] for row in domain_count_rows}
 
-
-def _receives_post_data(ioc_id: int, session) -> bool:
-    """Check if an IOC is classified as an exfiltration endpoint.
-
-    An IOC with role='exfil_endpoint' in any occurrence is considered to
-    receive POST data (this is how the IOC service labels form action URLs
-    that exfiltrate credentials).
-    """
-    from database import IocOccurrenceModel  # type: ignore[import-untyped]
-
-    exfil = (
-        session.query(IocOccurrenceModel)
-        .filter(
-            IocOccurrenceModel.ioc_id == ioc_id,
-            IocOccurrenceModel.role == "exfil_endpoint",
+    # 2. Phishkit linkage: find all snapshot_ids linked to phishkits, then find which ioc_ids
+    #    appear in those snapshots.
+    # First, get all snapshot_ids that contain any of our IOCs.
+    occ_snapshot_rows = (
+        session.query(
+            IocOccurrenceModel.ioc_id,
+            IocOccurrenceModel.snapshot_id,
         )
-        .first()
+        .filter(IocOccurrenceModel.ioc_id.in_(ioc_ids))
+        .all()
     )
-    return exfil is not None
+    # Map snapshot_id -> set of ioc_ids for fast lookup
+    snapshot_to_ioc_ids: dict[str, set[int]] = defaultdict(set)
+    all_snapshot_ids: set[str] = set()
+    for row in occ_snapshot_rows:
+        snapshot_to_ioc_ids[row.snapshot_id].add(row.ioc_id)
+        all_snapshot_ids.add(row.snapshot_id)
+
+    # Find which of those snapshots are linked to phishkits.
+    phishkit_snapshots = (
+        session.query(SnapshotPhishkitModel.snapshot_id)
+        .filter(SnapshotPhishkitModel.snapshot_id.in_(all_snapshot_ids))
+        .all()
+    )
+    phishkit_snapshot_ids = {row.snapshot_id for row in phishkit_snapshots}
+
+    ioc_has_phishkit: set[int] = set()
+    for snap_id in phishkit_snapshot_ids:
+        ioc_has_phishkit.update(snapshot_to_ioc_ids.get(snap_id, set()))
+
+    # 3. IOC roles: get the role from IocOccurrenceModel for each ioc_id.
+    #    If an IOC has multiple occurrences with different roles, prefer
+    #    'exfil_endpoint' over others (it is the strongest C2 signal).
+    role_rows = (
+        session.query(
+            IocOccurrenceModel.ioc_id,
+            IocOccurrenceModel.role,
+        )
+        .filter(IocOccurrenceModel.ioc_id.in_(ioc_ids))
+        .all()
+    )
+    ioc_roles: dict[int, str] = {}
+    for row in role_rows:
+        ioc_id = row.ioc_id
+        role = row.role or "resource"
+        existing = ioc_roles.get(ioc_id)
+        if existing is None or role == "exfil_endpoint":
+            # Prefer exfil_endpoint; otherwise keep whatever we saw first.
+            ioc_roles[ioc_id] = role
+
+    return ioc_domain_count, ioc_has_phishkit, ioc_roles
 
 
 # ---------------------------------------------------------------------------
@@ -150,16 +168,17 @@ def rank_c2_candidates(session) -> list[dict]:
         List of dicts, each with ioc_id, ioc_type, ioc_value, c2_score,
         and signals list.
     """
-    from database import (  # type: ignore[import-untyped]
-        AnalysisResultModel,
-        IocModel,
-        IocOccurrenceModel,
-    )
+    from database import IocModel  # type: ignore[import-untyped]
 
-    # Fetch all IOCs that are URLs or domains (most likely C2 vectors).
+    # Fetch IOCs that are URLs or domains (most likely C2 vectors),
+    # limited to those seen within the C2 time window.
+    cutoff = datetime.now(timezone.utc) - timedelta(days=C2_WINDOW_DAYS)
     iocs = (
         session.query(IocModel)
-        .filter(IocModel.type.in_(["url", "domain", "ip"]))
+        .filter(
+            IocModel.type.in_(["url", "domain", "ip"]),
+            IocModel.last_seen >= cutoff,
+        )
         .order_by(IocModel.id)
         .all()
     )
@@ -167,6 +186,10 @@ def rank_c2_candidates(session) -> list[dict]:
     if not iocs:
         logger.info("rank_c2_candidates: no IOCs found, returning empty list.")
         return []
+
+    # Bulk pre-load all C2 signals in 3 queries instead of 3 per IOC.
+    ioc_ids = [ioc.id for ioc in iocs]
+    ioc_domain_count, ioc_has_phishkit, ioc_roles = _bulk_preload_signals(ioc_ids, session)
 
     candidates: list[dict] = []
 
@@ -179,19 +202,19 @@ def rank_c2_candidates(session) -> list[dict]:
             score += SCORE_POST_FORM_TARGET
             signals.append("post_form_target")
 
-        # Signal 2: Used in 5+ domains
-        domain_count = _domain_count_for_ioc(ioc.id, session)
+        # Signal 2: Used in 5+ domains (from bulk pre-load)
+        domain_count = ioc_domain_count.get(ioc.id, 0)
         if domain_count >= MULTI_DOMAIN_THRESHOLD:
             score += SCORE_MULTI_DOMAIN
             signals.append(f"multi_domain:{domain_count}")
 
-        # Signal 3: Linked to phishkit
-        if _is_phishkit_linked(ioc.id, session):
+        # Signal 3: Linked to phishkit (from bulk pre-load)
+        if ioc.id in ioc_has_phishkit:
             score += SCORE_LINKED_PHISHKIT
             signals.append("phishkit_linked")
 
-        # Signal 4: Receives POST data (exfil_endpoint role)
-        if _receives_post_data(ioc.id, session):
+        # Signal 4: Receives POST data / exfil_endpoint role (from bulk pre-load)
+        if ioc_roles.get(ioc.id) == "exfil_endpoint":
             score += SCORE_RECEIVES_POST
             signals.append("receives_post_data")
 
