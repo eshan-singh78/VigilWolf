@@ -33,7 +33,7 @@ CAMPAIGN_RECHECK_INTERVAL_HOURS = 24
 _BRAND_DENYLIST = {
     "google", "cloudflare", "akamai", "amazon", "aws", "azure",
     "microsoft", "apple", "github", "gitlab", "docker",
-    "icloud", "citi",
+    "icloud",
     "npm", "jsdelivr", "unpkg", "cdnjs",
     "go", "me", "it", "be", "at", "us", "uk", "de", "fr",
     "my", "tv", "io", "ai", "co",
@@ -49,7 +49,7 @@ _LEGITIMATE_DOMAIN_DENYLIST = {
     "apple.com", "icloud.com", "usps.com", "dhl.com", "fedex.com",
     "ups.com", "google.com", "microsoft.com", "amazon.com",
     "netflix.com", "linkedin.com", "facebook.com", "twitter.com",
-    "x.com", "stripe.com", "shopify.com",
+    "x.com", "stripe.com", "shopify.com", "citibank.com",
 }
 
 
@@ -74,7 +74,6 @@ def _is_denied_domain(hostname: str) -> bool:
 # Ordered by specificity — longer keywords first to avoid partial matches.
 BRAND_KEYWORDS: list[tuple[str, str]] = [
     ("paypal", "PAYPAL"),
-    ("wellsfargo", "WELLSFARGO"),
     ("wellsfargo", "WELLSFARGO"),
     ("chase", "CHASE"),
     ("bankofamerica", "BANKOFAMERICA"),
