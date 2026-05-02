@@ -430,7 +430,7 @@ def orchestrate_analysis(ctx: SnapshotContext) -> None:
                     continue
 
                 # Check circuit breaker
-                if not circuit_breaker.should_run(plugin_name, plugin.plugin_type, queue_depth=0):
+                if not circuit_breaker.should_run(plugin_name, plugin.plugin_type, queue_depth=pipeline_metrics.queue_depth):
                     logger.info("Circuit breaker skipping plugin %r.", plugin_name)
                     continue
 
