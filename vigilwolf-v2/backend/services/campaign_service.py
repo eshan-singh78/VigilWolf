@@ -52,6 +52,25 @@ _LEGITIMATE_DOMAIN_DENYLIST = {
     "x.com", "stripe.com", "shopify.com",
 }
 
+
+def _is_denied_domain(hostname: str) -> bool:
+    """Check if a hostname matches the legitimate domain denylist.
+
+    Supports exact match and subdomain suffix match.
+    E.g., login.apple.com matches apple.com, accounts.google.com matches google.com.
+    """
+    if not hostname:
+        return False
+    hostname_lower = hostname.lower()
+    for denied in _LEGITIMATE_DOMAIN_DENYLIST:
+        # Exact match
+        if hostname_lower == denied:
+            return True
+        # Subdomain match: hostname ends with .denied
+        if hostname_lower.endswith(f".{denied}"):
+            return True
+    return False
+
 # Ordered by specificity — longer keywords first to avoid partial matches.
 BRAND_KEYWORDS: list[tuple[str, str]] = [
     ("paypal", "PAYPAL"),
@@ -141,7 +160,7 @@ def _detect_brand(domain_urls: list[str]) -> Optional[str]:
         return None
 
     # Exclude known legitimate infrastructure domains before brand matching.
-    hostnames = [h for h in hostnames if h not in _LEGITIMATE_DOMAIN_DENYLIST]
+    hostnames = [h for h in hostnames if not _is_denied_domain(h)]
     if not hostnames:
         return None
 
