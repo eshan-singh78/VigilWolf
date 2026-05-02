@@ -459,6 +459,17 @@ def orchestrate_analysis(ctx: SnapshotContext) -> None:
                         result = plugin.run(ctx)
                     all_results.append(result)
 
+                    # Inject enrichment findings into context for downstream plugins
+                    if result.plugin_name == "whois_enricher" and result.findings:
+                        if "registrar" in result.findings:
+                            ctx.metadata["registrar"] = result.findings["registrar"]
+                        if "creation_date" in result.findings:
+                            ctx.metadata["creation_date"] = result.findings["creation_date"]
+                        # Also update snapshot_record for scoring modifiers
+                        ctx.snapshot_record["registrar"] = result.findings.get("registrar", "")
+                    elif result.plugin_name == "dns_enricher" and result.findings:
+                        ctx.metadata["dns_records"] = result.findings
+
                     # Store AnalysisResultModel
                     with get_session() as session:
                         analysis_row = AnalysisResultModel(
