@@ -1,60 +1,63 @@
-"""VigilWolf v2 — In-memory pub/sub event bus for real-time SSE streaming.
-
-Thread-safe and async-safe: ``publish`` may be called from synchronous
-worker code (the pipeline) while ``subscribe`` / ``unsubscribe`` are used
-from async SSE handlers.
-
-Usage::
-
-    from services.event_bus import event_bus
-
-    # Publisher (worker / pipeline):
-    event_bus.publish("threat_detected", {"domain": "evil.com", "score": 85})
-
-    # Subscriber (SSE endpoint):
-    queue = event_bus.subscribe()
-    try:
-        event_type, data = await asyncio.wait_for(queue.get(), timeout=15)
-    except asyncio.TimeoutError:
-        # heartbeat
-    finally:
-        event_bus.unsubscribe(queue)
-"""
+"""VigilWolf v2 event bus with Redis pub/sub + in-memory fallback."""
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import threading
 from typing import Any
+
+import config
 
 logger = logging.getLogger(__name__)
 
 
 class EventBus:
-    """Simple in-memory publish/subscribe event bus.
+    """Redis-backed event bus with local in-memory fallback."""
 
-    Subscribers receive ``(event_type, data)`` tuples via ``asyncio.Queue``
-    instances. The bus is designed for same-process use — it does **not**
-    persist across restarts or scale to multiple processes (use Redis
-    pub/sub for that).
-    """
+    CHANNEL = "vigilwolf.events"
 
     def __init__(self) -> None:
         self._subscribers: list[asyncio.Queue[tuple[str, dict[str, Any]]]] = []
         self._lock = threading.Lock()
+        self._redis = None
+        self._redis_enabled = False
+        self._init_redis()
+
+    def _init_redis(self) -> None:
+        if not config.REDIS_URL:
+            return
+        try:
+            import redis
+
+            self._redis = redis.Redis.from_url(
+                config.REDIS_URL,
+                db=config.REDIS_CACHE_DB,
+                socket_connect_timeout=2,
+                socket_timeout=2,
+                decode_responses=True,
+            )
+            self._redis.ping()
+            self._redis_enabled = True
+            logger.info("Event bus connected to Redis pub/sub")
+        except Exception as exc:
+            self._redis = None
+            self._redis_enabled = False
+            logger.warning("Event bus Redis unavailable, using in-memory fallback: %s", exc)
 
     # ------------------------------------------------------------------
-    # Publish
-    # ------------------------------------------------------------------
-
     def publish(self, event_type: str, data: dict[str, Any]) -> None:
-        """Broadcast an event to every subscribed queue.
-
-        Safe to call from any thread — queues that belong to a running
-        event loop are fed via ``call_soon_threadsafe`` so the put is
-        scheduled on the correct loop.
-        """
+        """Broadcast event to Redis channel and local subscribers."""
         payload: tuple[str, dict[str, Any]] = (event_type, data)
+        if self._redis_enabled and self._redis is not None:
+            try:
+                self._redis.publish(
+                    self.CHANNEL,
+                    json.dumps({"event_type": event_type, "data": data}),
+                )
+            except Exception:
+                logger.exception("Failed to publish event to Redis")
+
         with self._lock:
             subscribers = list(self._subscribers)
 
@@ -72,30 +75,80 @@ class EventBus:
             except Exception:
                 logger.exception("Failed to publish event to subscriber queue")
 
-    # ------------------------------------------------------------------
-    # Subscribe / Unsubscribe
-    # ------------------------------------------------------------------
-
     def subscribe(self) -> asyncio.Queue[tuple[str, dict[str, Any]]]:
-        """Create a new subscriber queue and register it.
-
-        Callers should keep a reference to the returned queue and pass it
-        to :meth:`unsubscribe` when they disconnect.
-        """
+        """Create a local fallback subscriber queue."""
         queue: asyncio.Queue[tuple[str, dict[str, Any]]] = asyncio.Queue()
         with self._lock:
             self._subscribers.append(queue)
-        logger.info("SSE subscriber added (total: %d)", len(self._subscribers))
         return queue
 
     def unsubscribe(self, queue: asyncio.Queue[tuple[str, dict[str, Any]]]) -> None:
-        """Remove a previously registered subscriber queue."""
+        """Remove a local fallback subscriber queue."""
         with self._lock:
             try:
                 self._subscribers.remove(queue)
             except ValueError:
                 pass  # already removed — idempotent
-        logger.info("SSE subscriber removed (total: %d)", len(self._subscribers))
+
+    async def iter_events(
+        self,
+        local_queue: asyncio.Queue[tuple[str, dict[str, Any]]],
+    ):
+        """Yield event tuples from Redis (preferred) or local queue fallback.
+
+        When Redis is enabled, uses ``redis.asyncio`` so the event loop is
+        never blocked by a synchronous ``get_message`` call.  The local queue
+        is also drained on every iteration so that events published in-process
+        (which Redis pub/sub does not reflect back to the same subscriber) are
+        still delivered.
+        """
+        if self._redis_enabled and self._redis is not None:
+            import redis.asyncio as aioredis
+
+            async_redis = aioredis.Redis.from_url(
+                config.REDIS_URL,
+                db=config.REDIS_CACHE_DB,
+                decode_responses=True,
+            )
+            pubsub = async_redis.pubsub()
+            await pubsub.subscribe(self.CHANNEL)
+            try:
+                while True:
+                    # Drain any events published in-process first — Redis
+                    # pub/sub does not loop back to the same subscriber.
+                    while not local_queue.empty():
+                        try:
+                            event_type, data = local_queue.get_nowait()
+                            yield event_type, data
+                        except asyncio.QueueEmpty:
+                            break
+
+                    msg = await pubsub.get_message(
+                        ignore_subscribe_messages=True,
+                        timeout=1.0,
+                    )
+                    if not msg:
+                        continue
+                    raw = msg.get("data")
+                    if not raw:
+                        continue
+                    try:
+                        parsed = json.loads(raw)
+                        event_type = parsed.get("event_type")
+                        data = parsed.get("data")
+                        if isinstance(event_type, str) and isinstance(data, dict):
+                            yield event_type, data
+                    except Exception:
+                        logger.exception("Failed to parse Redis event payload")
+            finally:
+                await pubsub.unsubscribe(self.CHANNEL)
+                await pubsub.close()
+                await async_redis.aclose()
+            return
+
+        while True:
+            event_type, data = await local_queue.get()
+            yield event_type, data
 
     # ------------------------------------------------------------------
     # Internals
@@ -122,7 +175,4 @@ class EventBus:
             return None
 
 
-# ---------------------------------------------------------------------------
-# Module-level singleton — import this from other modules
-# ---------------------------------------------------------------------------
 event_bus = EventBus()
