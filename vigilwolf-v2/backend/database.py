@@ -186,7 +186,7 @@ class DomainProcessingStateModel(Base):
         String(10), nullable=False, default="low",
         # CHECK constraint: high | low
     )
-    updated_at = Column(DateTime, default=utc_now, onupdate=utc_now, nullable=False)
+    updated_at = Column(DateTime, default=utc_now, nullable=False)
 
     # relationships
     domain = relationship("DomainModel", back_populates="processing_state")
@@ -314,7 +314,7 @@ class PluginWeightModel(Base):
     plugin_name = Column(String(50), unique=True, nullable=False)
     weight = Column(Float, default=1.0, nullable=False)
     enabled = Column(Boolean, default=True, nullable=False)
-    updated_at = Column(DateTime, default=utc_now, onupdate=utc_now, nullable=False)
+    updated_at = Column(DateTime, default=utc_now, nullable=False)
 
 
 class WebhookModel(Base):
