@@ -68,6 +68,7 @@ ALLOWED_ORIGINS = os.getenv(
     "http://localhost:3000,http://127.0.0.1:3000"
 ).split(",")
 RATE_LIMIT_PER_MINUTE = int(os.getenv("RATE_LIMIT_PER_MINUTE", "60"))
+TRUSTED_PROXIES = [p.strip() for p in os.getenv("TRUSTED_PROXIES", "").split(",") if p.strip()]
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -215,6 +216,7 @@ def get_config_summary() -> dict:
         "api": {
             "allowed_origins": ALLOWED_ORIGINS,
             "rate_limit_per_minute": RATE_LIMIT_PER_MINUTE,
+            "trusted_proxies": TRUSTED_PROXIES,
             "api_key_configured": bool(API_KEY),
         },
         "logging": {

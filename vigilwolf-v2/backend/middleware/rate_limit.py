@@ -59,7 +59,7 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         if request.url.path in self.exempt_paths:
             return await call_next(request)
 
-        client_ip = request.client.host if request.client else "unknown"
+        client_ip = self._get_client_ip(request)
 
         if self._redis_client is not None:
             return await self._redis_dispatch(request, call_next, client_ip)
@@ -68,13 +68,17 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
     # -- Redis-backed path ---------------------------------------------------
 
     async def _redis_dispatch(self, request: Request, call_next, client_ip: str):
-        minute_window = int(time.time() // 60)
-        key = f"rate_limit:{client_ip}:{minute_window}"
+        now = time.time()
+        window_start = now - 60.0
+        key = f"rate_limit:{client_ip}"
 
         try:
-            count = self._redis_client.incr(key)
-            if count == 1:
-                self._redis_client.expire(key, 120)  # 2 min TTL covers clock skew
+            pipe = self._redis_client.pipeline(transaction=True)
+            pipe.zremrangebyscore(key, 0, window_start)
+            pipe.zadd(key, {f"{now}": now})
+            pipe.zcard(key)
+            pipe.expire(key, 120)
+            _, _, count, _ = pipe.execute()
             if count > self.requests_per_minute:
                 return JSONResponse(
                     status_code=429,
@@ -101,9 +105,14 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
 
         # Prune old entries
         timestamps = self._requests[client_ip]
-        self._requests[client_ip] = [t for t in timestamps if now - t < window]
+        pruned = [t for t in timestamps if now - t < window]
+        if pruned:
+            self._requests[client_ip] = pruned
+        elif client_ip in self._requests:
+            del self._requests[client_ip]
+            pruned = []
 
-        if len(self._requests[client_ip]) >= self.requests_per_minute:
+        if len(pruned) >= self.requests_per_minute:
             return JSONResponse(
                 status_code=429,
                 content={"detail": "Rate limit exceeded. Try again later."},
@@ -111,3 +120,19 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
 
         self._requests[client_ip].append(now)
         return await call_next(request)
+
+    @staticmethod
+    def _get_client_ip(request: Request) -> str:
+        """Resolve client IP, only trusting proxy headers from configured proxies."""
+        from config import TRUSTED_PROXIES
+        direct_ip = request.client.host if request.client else "unknown"
+        if TRUSTED_PROXIES and direct_ip in TRUSTED_PROXIES:
+            xff = request.headers.get("x-forwarded-for", "")
+            if xff:
+                first = xff.split(",")[0].strip()
+                if first:
+                    return first
+            xrip = request.headers.get("x-real-ip", "").strip()
+            if xrip:
+                return xrip
+        return direct_ip
