@@ -336,6 +336,60 @@ def get_clusters_for_domain(domain_id: str, session) -> list[dict]:
     ]
 
 
+# ---------------------------------------------------------------------------
+# Snapshot-level entry point
+# ---------------------------------------------------------------------------
+
+
+def cluster_snapshot(snapshot_id: str) -> int:
+    """Run clustering triggered by a specific snapshot.
+
+    Opens a DB session, verifies the snapshot exists, runs both structural
+    hash and infrastructure clustering, and returns the total number of
+    clusters created or updated.  Exceptions are caught and logged so the
+    caller never has to handle them.
+
+    Args:
+        snapshot_id: UUID of the snapshot that triggered this pipeline run.
+
+    Returns:
+        Total number of clusters created/updated (0 if nothing happened or
+        an error occurred).
+    """
+    try:
+        from database import AnalysisResultModel, SnapshotModel, get_session  # type: ignore[import-untyped]
+
+        with get_session() as session:
+            # Verify the snapshot exists.
+            snapshot = session.query(SnapshotModel).get(snapshot_id)
+            if snapshot is None:
+                logger.warning(
+                    "cluster_snapshot: snapshot %s not found; skipping.",
+                    snapshot_id,
+                )
+                return 0
+
+            # Run both clustering passes.
+            structural = cluster_by_structural_hash(session)
+            infra = cluster_by_infrastructure(session)
+            session.commit()
+
+        total = (
+            structural.get("clusters_created", 0)
+            + infra.get("clusters_created", 0)
+        )
+        logger.info(
+            "cluster_snapshot(%s): %d clusters created/updated",
+            snapshot_id, total,
+        )
+        return total
+    except Exception:
+        logger.exception(
+            "cluster_snapshot failed for snapshot_id=%s", snapshot_id,
+        )
+        return 0
+
+
 def get_cluster_details(cluster_id: str, session) -> Optional[dict]:
     """Return full cluster details including all member domains.
 

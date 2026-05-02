@@ -277,6 +277,56 @@ def detect_campaigns(session) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Snapshot-level entry point
+# ---------------------------------------------------------------------------
+
+
+def detect_campaigns_for_snapshot(snapshot_id: str) -> int:
+    """Run campaign detection triggered by a specific snapshot.
+
+    Opens a DB session, verifies the snapshot exists, runs campaign detection
+    on all qualifying clusters, and returns the total number of campaigns
+    created or updated.  Exceptions are caught and logged so the caller never
+    has to handle them.
+
+    Args:
+        snapshot_id: UUID of the snapshot that triggered this pipeline run.
+
+    Returns:
+        Total number of campaigns created/updated (0 if nothing happened or
+        an error occurred).
+    """
+    try:
+        from database import SnapshotModel, get_session  # type: ignore[import-untyped]
+
+        with get_session() as session:
+            # Verify the snapshot exists.
+            snapshot = session.query(SnapshotModel).get(snapshot_id)
+            if snapshot is None:
+                logger.warning(
+                    "detect_campaigns_for_snapshot: snapshot %s not found; skipping.",
+                    snapshot_id,
+                )
+                return 0
+
+            # Run campaign detection across all qualifying clusters.
+            result = detect_campaigns(session)
+            session.commit()
+
+        total = result.get("campaigns_created", 0) + result.get("campaigns_updated", 0)
+        logger.info(
+            "detect_campaigns_for_snapshot(%s): %d campaigns created/updated",
+            snapshot_id, total,
+        )
+        return total
+    except Exception:
+        logger.exception(
+            "detect_campaigns_for_snapshot failed for snapshot_id=%s", snapshot_id,
+        )
+        return 0
+
+
+# ---------------------------------------------------------------------------
 # Read queries
 # ---------------------------------------------------------------------------
 

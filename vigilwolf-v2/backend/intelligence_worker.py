@@ -88,49 +88,34 @@ def run_intelligence_pipeline(snapshot_id: str) -> Optional[dict]:
     # --- Stage 1: Clustering ---
     if config.CLUSTERING_ENABLED:
         try:
-            from database import get_session  # type: ignore[import-untyped]
-            from services.clustering_service import (  # type: ignore[import-untyped]
-                cluster_by_structural_hash,
-                cluster_by_infrastructure,
-            )
+            from services.clustering_service import cluster_snapshot  # type: ignore[import-untyped]
 
-            with get_session() as session:
-                structural = cluster_by_structural_hash(session)
-                session.commit()
-            results["stages"]["clustering_structural"] = structural
-
-            with get_session() as session:
-                infra = cluster_by_infrastructure(session)
-                session.commit()
-            results["stages"]["clustering_infra"] = infra
+            cluster_count = cluster_snapshot(snapshot_id)
+            results["stages"]["clustering"] = {"clusters_created_or_updated": cluster_count}
 
             logger.info(
-                "Clustering complete for snapshot_id=%s: structural=%s, infra=%s",
-                snapshot_id, structural, infra,
+                "Clustering complete for snapshot_id=%s: %d clusters created/updated",
+                snapshot_id, cluster_count,
             )
         except Exception:
             logger.exception(
                 "Clustering failed for snapshot_id=%s; continuing.", snapshot_id,
             )
-            results["stages"]["clustering_structural"] = {"error": True}
-            results["stages"]["clustering_infra"] = {"error": True}
+            results["stages"]["clustering"] = {"error": True}
     else:
         logger.debug("Clustering disabled; skipping for snapshot_id=%s", snapshot_id)
 
     # --- Stage 2: Campaign detection ---
     if config.CAMPAIGN_DETECTION_ENABLED:
         try:
-            from database import get_session  # type: ignore[import-untyped]
-            from services.campaign_service import detect_campaigns  # type: ignore[import-untyped]
+            from services.campaign_service import detect_campaigns_for_snapshot  # type: ignore[import-untyped]
 
-            with get_session() as session:
-                campaign_result = detect_campaigns(session)
-                session.commit()
-            results["stages"]["campaign_detection"] = campaign_result
+            campaign_count = detect_campaigns_for_snapshot(snapshot_id)
+            results["stages"]["campaign_detection"] = {"campaigns_created_or_updated": campaign_count}
 
             logger.info(
-                "Campaign detection complete for snapshot_id=%s: %s",
-                snapshot_id, campaign_result,
+                "Campaign detection complete for snapshot_id=%s: %d campaigns created/updated",
+                snapshot_id, campaign_count,
             )
         except Exception:
             logger.exception(
@@ -146,17 +131,14 @@ def run_intelligence_pipeline(snapshot_id: str) -> Optional[dict]:
     # --- Stage 3: PhishKit detection ---
     if config.PHISHKIT_DETECTION_ENABLED:
         try:
-            from database import get_session  # type: ignore[import-untyped]
-            from services.phishkit_service import detect_phishkits  # type: ignore[import-untyped]
+            from services.phishkit_service import detect_phishkits_for_snapshot  # type: ignore[import-untyped]
 
-            with get_session() as session:
-                phishkit_result = detect_phishkits(session)
-                session.commit()
-            results["stages"]["phishkit_detection"] = phishkit_result
+            phishkit_count = detect_phishkits_for_snapshot(snapshot_id)
+            results["stages"]["phishkit_detection"] = {"phishkits_created_or_updated": phishkit_count}
 
             logger.info(
-                "PhishKit detection complete for snapshot_id=%s: %s",
-                snapshot_id, phishkit_result,
+                "PhishKit detection complete for snapshot_id=%s: %d phishkits created/updated",
+                snapshot_id, phishkit_count,
             )
         except Exception:
             logger.exception(

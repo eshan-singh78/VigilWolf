@@ -288,6 +288,77 @@ def _upsert_phishkit_cluster(
 
 
 # ---------------------------------------------------------------------------
+# Snapshot-level entry point
+# ---------------------------------------------------------------------------
+
+
+def detect_phishkits_for_snapshot(snapshot_id: str) -> int:
+    """Run phishkit detection triggered by a specific snapshot.
+
+    Opens a DB session, verifies the snapshot exists and has html_hasher
+    analysis results, runs phishkit detection, and returns the total number
+    of phishkits created or updated.  Exceptions are caught and logged so
+    the caller never has to handle them.
+
+    Args:
+        snapshot_id: UUID of the snapshot that triggered this pipeline run.
+
+    Returns:
+        Total number of phishkits created/updated (0 if nothing happened or
+        an error occurred).
+    """
+    try:
+        from database import (  # type: ignore[import-untyped]
+            AnalysisResultModel,
+            SnapshotModel,
+            get_session,
+        )
+
+        with get_session() as session:
+            # Verify the snapshot exists.
+            snapshot = session.query(SnapshotModel).get(snapshot_id)
+            if snapshot is None:
+                logger.warning(
+                    "detect_phishkits_for_snapshot: snapshot %s not found; skipping.",
+                    snapshot_id,
+                )
+                return 0
+
+            # Check for html_hasher results for this snapshot.
+            has_results = (
+                session.query(AnalysisResultModel)
+                .filter(
+                    AnalysisResultModel.snapshot_id == snapshot_id,
+                    AnalysisResultModel.plugin_name == "html_hasher",
+                )
+                .first()
+            )
+            if has_results is None:
+                logger.debug(
+                    "detect_phishkits_for_snapshot: no html_hasher results for "
+                    "snapshot %s; skipping.",
+                    snapshot_id,
+                )
+                return 0
+
+            # Run phishkit detection across all qualifying snapshots.
+            result = detect_phishkits(session)
+            session.commit()
+
+        total = result.get("phishkits_created", 0) + result.get("phishkits_updated", 0)
+        logger.info(
+            "detect_phishkits_for_snapshot(%s): %d phishkits created/updated",
+            snapshot_id, total,
+        )
+        return total
+    except Exception:
+        logger.exception(
+            "detect_phishkits_for_snapshot failed for snapshot_id=%s", snapshot_id,
+        )
+        return 0
+
+
+# ---------------------------------------------------------------------------
 # Read queries
 # ---------------------------------------------------------------------------
 
