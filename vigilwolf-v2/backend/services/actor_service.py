@@ -12,7 +12,7 @@ import itertools
 import logging
 import uuid
 from collections import defaultdict
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from sqlalchemy.exc import IntegrityError
@@ -28,6 +28,7 @@ WEIGHT_SHARED_IOCS = 0.2
 WEIGHT_TEMPORAL = 0.2
 
 MAX_CAMPAIGNS_PER_PROFILE = 100
+CAMPAIGN_WINDOW_DAYS = 30
 
 # Confidence thresholds
 CONFIDENCE_THRESHOLD = 0.6
@@ -244,7 +245,16 @@ def profile_actors(session) -> dict:
         CampaignModel,
     )
 
-    campaigns = session.query(CampaignModel).all()
+    campaign_cutoff = datetime.now(timezone.utc) - timedelta(days=CAMPAIGN_WINDOW_DAYS)
+    campaigns = (
+        session.query(CampaignModel)
+        .filter(
+            CampaignModel.status.in_(["active", "dormant"]),
+            CampaignModel.last_seen >= campaign_cutoff,
+        )
+        .order_by(CampaignModel.last_seen.desc())
+        .all()
+    )
     if len(campaigns) < 2:
         logger.info("profile_actors: fewer than 2 campaigns, nothing to profile.")
         return {"actors_created": 0, "actors_updated": 0}
@@ -352,19 +362,23 @@ def profile_actors(session) -> dict:
         if hasattr(ip_row, "asn") and ip_row.asn:
             domain_asn_map.setdefault(ip_row.domain_id, str(ip_row.asn))
 
-    # Pre-load exfil IOCs for fingerprint building
+    # Pre-load exfil IOCs for fingerprint building (single filtered query)
     exfil_ioc_map: dict[str, list[str]] = {}  # domain_id -> [ioc_value, ...]
-    all_exfil = (
-        session.query(IocOccurrenceModel, IocModel)
-        .join(IocModel, IocOccurrenceModel.ioc_id == IocModel.id)
-        .filter(IocOccurrenceModel.role == "exfil_endpoint", IocModel.type == "url")
-        .all()
-    )
-    for occ, ioc in all_exfil:
-        # Resolve domain via snapshot
-        snap = session.query(SnapshotModel).get(occ.snapshot_id)
-        if snap:
-            exfil_ioc_map.setdefault(snap.domain_id, []).append(ioc.value)
+    if relevant_domain_ids:
+        exfil_rows = (
+            session.query(SnapshotModel.domain_id, IocModel.value)
+            .join(IocOccurrenceModel, IocOccurrenceModel.snapshot_id == SnapshotModel.id)
+            .join(IocModel, IocOccurrenceModel.ioc_id == IocModel.id)
+            .filter(
+                IocOccurrenceModel.role == "exfil_endpoint",
+                IocModel.type == "url",
+                SnapshotModel.domain_id.in_(relevant_domain_ids),
+            )
+            .distinct()
+            .all()
+        )
+        for row in exfil_rows:
+            exfil_ioc_map.setdefault(row.domain_id, []).append(row.value)
 
     # Pre-load ALL existing actor-campaign mappings to avoid per-pair queries
     actor_campaign_pairs: dict[frozenset[str], str] = {}  # {camp_id_a, camp_id_b} -> actor_id
