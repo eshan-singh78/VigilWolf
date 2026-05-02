@@ -4,6 +4,7 @@ This module centralizes all configuration settings for the monitoring system,
 loading values from environment variables with sensible defaults.
 """
 import os
+import re
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
@@ -76,16 +77,26 @@ LOG_FILE = os.getenv("LOG_FILE", "")
 JSON_LOGGING = os.getenv("JSON_LOGGING", "false").lower() == "true"
 
 # ---------------------------------------------------------------------------
+# Environment
+# ---------------------------------------------------------------------------
+ENVIRONMENT = os.getenv("ENVIRONMENT", "development")
+
+# ---------------------------------------------------------------------------
 # Authentication
 # ---------------------------------------------------------------------------
 API_KEY = os.getenv("API_KEY", "")
+if ENVIRONMENT == "production" and not API_KEY:
+    import logging
+    logging.getLogger(__name__).critical(
+        "API_KEY is not set in production. Refusing to start without authentication. "
+        "Set the API_KEY environment variable."
+    )
 
 # ---------------------------------------------------------------------------
-# Environment / Security
+# Security
 # ---------------------------------------------------------------------------
-ENVIRONMENT = os.getenv("ENVIRONMENT", "development")
 TRUSTED_HOSTS = os.getenv("TRUSTED_HOSTS", "localhost,127.0.0.1").split(",")
-FORCE_HTTPS = os.getenv("FORCE_HTTPS", "true").lower() == "true"
+FORCE_HTTPS = os.getenv("FORCE_HTTPS", "false").lower() == "true"
 
 # ---------------------------------------------------------------------------
 # Redis
@@ -104,7 +115,7 @@ REQUEST_ID_HEADER = os.getenv("REQUEST_ID_HEADER", "X-Request-ID")
 USE_DRAMATIQ_PIPELINE = os.getenv("USE_DRAMATIQ_PIPELINE", "false").lower() == "true"
 CLUSTERING_ENABLED = os.getenv("CLUSTERING_ENABLED", "false").lower() == "true"
 ALERTS_ENABLED = os.getenv("ALERTS_ENABLED", "false").lower() == "true"
-ALERTS_DRY_RUN = os.getenv("ALERTS_DRY_RUN", "true").lower() == "true"
+ALERTS_DRY_RUN = os.getenv("ALERTS_DRY_RUN", "false").lower() == "true"
 
 # ---------------------------------------------------------------------------
 # v2 — Per-plugin feature flags
@@ -163,7 +174,7 @@ def get_config_summary() -> dict:
             "snapshots_dir": SNAPSHOTS_DIR,
         },
         "database": {
-            "database_url": DATABASE_URL.replace("://", "://<hidden>") if "://" in DATABASE_URL else DATABASE_URL,
+            "database_url": re.sub(r"(://[^:]+:)([^@]+)(@)", r"\1<hidden>\3", DATABASE_URL) if "://" in DATABASE_URL else DATABASE_URL,
         },
         "monitoring": {
             "max_concurrent_checks": MAX_CONCURRENT_CHECKS,
