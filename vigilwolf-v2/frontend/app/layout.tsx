@@ -2,6 +2,7 @@ import type { Metadata } from "next";
 import { QueryProvider } from "@/lib/query-client";
 import { Sidebar } from "@/components/layout/sidebar";
 import { Header } from "@/components/layout/header";
+import { AuthGate } from "@/components/auth/auth-gate";
 import "./globals.css";
 
 export const metadata: Metadata = {
@@ -18,13 +19,15 @@ export default function RootLayout({
     <html lang="en" className="dark">
       <body>
         <QueryProvider>
-          <div className="flex h-screen overflow-hidden">
-            <Sidebar />
-            <div className="flex flex-1 flex-col overflow-hidden">
-              <Header />
-              <main className="flex-1 overflow-auto p-6">{children}</main>
+          <AuthGate>
+            <div className="flex h-screen overflow-hidden">
+              <Sidebar />
+              <div className="flex flex-1 flex-col overflow-hidden">
+                <Header />
+                <main className="flex-1 overflow-auto p-6">{children}</main>
+              </div>
             </div>
-          </div>
+          </AuthGate>
         </QueryProvider>
       </body>
     </html>

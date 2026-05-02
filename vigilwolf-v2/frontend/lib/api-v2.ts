@@ -2,11 +2,24 @@ interface ApiEnvelope<T> {
   data: T;
 }
 
+/** Retrieve the stored API key from localStorage (SSR-safe). */
+function getApiKey(): string | null {
+  if (typeof window === "undefined") return null;
+  return localStorage.getItem("vigilwolf_api_key");
+}
+
 async function apiFetch<T>(path: string, options?: RequestInit): Promise<T> {
+  const apiKey = getApiKey();
+  const authHeaders: Record<string, string> = {};
+  if (apiKey) {
+    authHeaders["X-API-Key"] = apiKey;
+  }
+
   const res = await fetch(`/api/v2${path}`, {
     ...options,
     headers: {
       "Content-Type": "application/json",
+      ...authHeaders,
       ...options?.headers,
     },
   });
