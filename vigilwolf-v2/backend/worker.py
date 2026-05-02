@@ -228,6 +228,12 @@ def build_snapshot_context(
     Extracts visible text, forms (with password/hidden/action/method),
     links, scripts, and metadata (title + meta tags).
     """
+    if len(html.encode("utf-8", errors="replace")) > MAX_HTML_SIZE:
+        raise ValueError(
+            f"HTML too large ({len(html.encode('utf-8', errors='replace'))} bytes) "
+            f"for snapshot_id={snapshot_id}; maximum is {MAX_HTML_SIZE} bytes"
+        )
+
     soup = BeautifulSoup(html, "html.parser")
 
     # --- Visible text ---
@@ -433,6 +439,9 @@ def capture_domain(domain_id: str, url: str, trigger_type: str = "nrd_ingest") -
             except ImportError:
                 if config.ENVIRONMENT == "production":
                     raise RuntimeError("storage_manager module missing in production")
+                logger.warning("storage_manager not available; marking snapshot as incomplete.")
+                snapshot.success = False
+                snapshot.error_message = "storage_manager not available in development"
                 html_path = ""
 
             if config.ENVIRONMENT == "production" and not html_path:
@@ -648,33 +657,43 @@ def orchestrate_analysis(ctx: SnapshotContext) -> None:
         # This runs regardless of scoring success — IOC data is needed by
         # downstream intelligence services (clustering, campaigns).
         ioc_results = [r for r in all_results if r.plugin_name == "ioc_extractor" and not r.error]
+        ioc_persisted = False
         if ioc_results:
-            try:
-                from services.ioc_service import persist_iocs
-                with get_session() as ioc_session:
-                    for ioc_result in ioc_results:
-                        persist_iocs(
-                            snapshot_id=ctx.snapshot_id,
-                            findings=ioc_result.findings,
-                            session=ioc_session,
-                        )
-                    ioc_session.commit()
-                    logger.info("Persisted IOC results for snapshot_id=%s", ctx.snapshot_id)
-            except Exception:
-                logger.exception("Failed to persist IOCs for snapshot_id=%s", ctx.snapshot_id)
+            max_retries = 3
+            for attempt in range(max_retries):
+                try:
+                    from services.ioc_service import persist_iocs
+                    with get_session() as ioc_session:
+                        for ioc_result in ioc_results:
+                            persist_iocs(
+                                snapshot_id=ctx.snapshot_id,
+                                findings=ioc_result.findings,
+                                session=ioc_session,
+                            )
+                        ioc_session.commit()
+                        logger.info("Persisted IOC results for snapshot_id=%s", ctx.snapshot_id)
+                        ioc_persisted = True
+                        break
+                except Exception:
+                    if attempt < max_retries - 1:
+                        import time
+                        time.sleep(2 ** attempt)  # 1s, 2s backoff
+                        logger.warning("IOC persistence attempt %d failed for snapshot_id=%s; retrying", attempt + 1, ctx.snapshot_id)
+                    else:
+                        logger.exception("Failed to persist IOCs for snapshot_id=%s after %d attempts", ctx.snapshot_id, max_retries)
 
         # Increment Prometheus counter for domains processed
         _inc_domains_processed()
 
-        # Enqueue intelligence pipeline (clustering, campaigns, phishkits, actors)
-        # Runs even if scoring failed — intelligence pipeline uses plugin results,
-        # not the risk score.
-        if config.INTELLIGENCE_PIPELINE_ENABLED:
-            try:
-                from intelligence_worker import enqueue_intelligence_pipeline
-                enqueue_intelligence_pipeline(ctx.snapshot_id)
-            except Exception:
-                logger.exception("Failed to enqueue intelligence pipeline for snapshot_id=%s", ctx.snapshot_id)
+        # Enqueue intelligence pipeline only if IOC data was persisted (or no IOC results to persist).
+        # Clustering and campaigns need IOC occurrences to produce meaningful results.
+        if ioc_persisted or not ioc_results:
+            if config.INTELLIGENCE_PIPELINE_ENABLED:
+                try:
+                    from intelligence_worker import enqueue_intelligence_pipeline
+                    enqueue_intelligence_pipeline(ctx.snapshot_id)
+                except Exception:
+                    logger.exception("Failed to enqueue intelligence pipeline for snapshot_id=%s", ctx.snapshot_id)
 
         # Record pipeline success/failure metric
         if scoring_failed:
