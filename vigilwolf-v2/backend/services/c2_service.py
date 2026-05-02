@@ -30,6 +30,10 @@ MAX_CANDIDATES = 50
 # Only consider IOCs seen within this many days for C2 ranking.
 C2_WINDOW_DAYS = 30
 
+# Maximum number of IOC candidates to load for C2 ranking.
+# Caps memory usage at scale by prioritizing most-recently-seen IOCs.
+MAX_C2_IOC_CANDIDATES = 5000
+
 
 # ---------------------------------------------------------------------------
 # Signal detectors
@@ -179,7 +183,8 @@ def rank_c2_candidates(session) -> list[dict]:
             IocModel.type.in_(["url", "domain", "ip"]),
             IocModel.last_seen >= cutoff,
         )
-        .order_by(IocModel.id)
+        .order_by(IocModel.last_seen.desc())  # most recent first
+        .limit(MAX_C2_IOC_CANDIDATES)
         .all()
     )
 

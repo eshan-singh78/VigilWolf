@@ -157,8 +157,16 @@ def cluster_by_structural_hash(session) -> dict:
 
         # Update cluster metadata.
         if added:
-            cluster.domain_count += added
-            cluster.last_seen = datetime.now(timezone.utc)
+            from sqlalchemy import update as sa_update
+            session.execute(
+                sa_update(ClusterModel)
+                .where(ClusterModel.id == cluster.id)
+                .values(
+                    domain_count=ClusterModel.domain_count + added,
+                    last_seen=datetime.now(timezone.utc),
+                )
+            )
+            session.refresh(cluster, ["domain_count", "last_seen"])
             domains_clustered += added
             logger.debug(
                 "Cluster %s: added %d domains (total %d)",
@@ -363,8 +371,16 @@ def cluster_by_infrastructure(session) -> dict:
                 )
 
         if added:
-            cluster.domain_count += added
-            cluster.last_seen = datetime.now(timezone.utc)
+            from sqlalchemy import update as sa_update
+            session.execute(
+                sa_update(ClusterModel)
+                .where(ClusterModel.id == cluster.id)
+                .values(
+                    domain_count=ClusterModel.domain_count + added,
+                    last_seen=datetime.now(timezone.utc),
+                )
+            )
+            session.refresh(cluster, ["domain_count", "last_seen"])
             domains_clustered += added
             logger.debug(
                 "Infra cluster %s: added %d domains (total %d)",
