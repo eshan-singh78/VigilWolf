@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import select, func
 from sqlalchemy.orm import Session
 
@@ -46,7 +46,7 @@ class DomainBrief(BaseModel):
 
 
 class GroupCreateRequest(BaseModel):
-    name: str
+    name: str = Field(..., min_length=1, max_length=200)
     description: Optional[str] = None
 
 
@@ -57,8 +57,8 @@ class GroupUpdateRequest(BaseModel):
 
 class AddDomainRequest(BaseModel):
     """Request body for adding a domain to a monitoring group."""
-    domain: str
-    frequency_seconds: int = 3600
+    domain: str = Field(..., min_length=1, max_length=253)
+    frequency_seconds: int = Field(3600, ge=60, le=86400)
 
 
 class AddDomainResponse(BaseModel):

@@ -11,6 +11,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from database import WebhookModel, get_db
+from plugins.capture_engine import validate_capture_url, CaptureError
 from services.alert_service import build_webhook_payload, sign_payload
 
 router = APIRouter()
@@ -21,10 +22,10 @@ router = APIRouter()
 # ---------------------------------------------------------------------------
 
 class WebhookCreate(BaseModel):
-    name: str
-    url: str
-    secret: Optional[str] = None
-    events: list[str] = Field(default_factory=lambda: ["phishing_detected"])
+    name: str = Field(..., min_length=1, max_length=200)
+    url: str = Field(..., max_length=2048)
+    secret: Optional[str] = Field(None, min_length=16, max_length=256)
+    events: list[str] = Field(default_factory=lambda: ["phishing_detected"], max_length=20)
     enabled: bool = True
     filters: dict = Field(default_factory=dict)
 
@@ -42,13 +43,17 @@ class WebhookResponse(BaseModel):
     id: str
     name: str
     url: str
-    secret: Optional[str] = None
     events: list
     enabled: bool
     filters: dict
     created_at: Optional[str] = None
 
     model_config = ConfigDict(from_attributes=True)
+
+
+class WebhookCreateResponse(WebhookResponse):
+    """Returned only on creation/update — includes the secret once."""
+    secret: Optional[str] = None
 
 
 class WebhookTestResponse(BaseModel):
@@ -62,11 +67,11 @@ class WebhookTestResponse(BaseModel):
 # ---------------------------------------------------------------------------
 
 def _webhook_to_response(wh: WebhookModel) -> WebhookResponse:
+    """Map ORM object to response — secret is NEVER included."""
     return WebhookResponse(
         id=wh.id,
         name=wh.name,
         url=wh.url,
-        secret=wh.secret,
         events=wh.events if isinstance(wh.events, list) else [],
         enabled=wh.enabled,
         filters=wh.filters if isinstance(wh.filters, dict) else {},
@@ -74,13 +79,38 @@ def _webhook_to_response(wh: WebhookModel) -> WebhookResponse:
     )
 
 
+def _webhook_to_create_response(wh: WebhookModel) -> WebhookCreateResponse:
+    """Map ORM object to creation response — includes secret once for the caller to save."""
+    return WebhookCreateResponse(
+        id=wh.id,
+        name=wh.name,
+        url=wh.url,
+        secret=_mask_secret(wh.secret) if wh.secret else None,
+        events=wh.events if isinstance(wh.events, list) else [],
+        enabled=wh.enabled,
+        filters=wh.filters if isinstance(wh.filters, dict) else {},
+        created_at=wh.created_at.isoformat() if wh.created_at else None,
+    )
+
+
+def _mask_secret(secret: str) -> str:
+    """Return a masked version of the secret for one-time display."""
+    if len(secret) <= 8:
+        return secret[:2] + "****"
+    return secret[:4] + "****" + secret[-4:]
+
+
 # ---------------------------------------------------------------------------
 # Endpoints
 # ---------------------------------------------------------------------------
 
 @router.post("/webhooks", status_code=201, )
-def create_webhook(body: WebhookCreate, session: Session = Depends(get_db)) -> WebhookResponse:
-    """Create a new webhook."""
+def create_webhook(body: WebhookCreate, session: Session = Depends(get_db)) -> WebhookCreateResponse:
+    """Create a new webhook. Secret is returned once in this response only."""
+    try:
+        validate_capture_url(body.url)
+    except CaptureError as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid webhook URL: {exc}") from exc
     wh = WebhookModel(
         name=body.name,
         url=body.url,
@@ -92,7 +122,7 @@ def create_webhook(body: WebhookCreate, session: Session = Depends(get_db)) -> W
     session.add(wh)
     session.commit()
     session.refresh(wh)
-    return _webhook_to_response(wh)
+    return _webhook_to_create_response(wh)
 
 
 @router.get("/webhooks", )
@@ -112,19 +142,24 @@ def get_webhook(webhook_id: str, session: Session = Depends(get_db)) -> WebhookR
 
 
 @router.put("/webhooks/{webhook_id}", )
-def update_webhook(webhook_id: str, body: WebhookUpdate, session: Session = Depends(get_db)) -> WebhookResponse:
-    """Update a webhook."""
+def update_webhook(webhook_id: str, body: WebhookUpdate, session: Session = Depends(get_db)) -> WebhookCreateResponse:
+    """Update a webhook. Secret is returned once if it was changed."""
     wh = session.get(WebhookModel, webhook_id)
     if not wh:
         raise HTTPException(status_code=404, detail="Webhook not found")
 
     update_data = body.model_dump(exclude_unset=True)
+    if "url" in update_data:
+        try:
+            validate_capture_url(update_data["url"])
+        except CaptureError as exc:
+            raise HTTPException(status_code=400, detail=f"Invalid webhook URL: {exc}") from exc
     for key, value in update_data.items():
         setattr(wh, key, value)
 
     session.commit()
     session.refresh(wh)
-    return _webhook_to_response(wh)
+    return _webhook_to_create_response(wh)
 
 
 @router.delete("/webhooks/{webhook_id}", )
