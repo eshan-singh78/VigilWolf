@@ -408,7 +408,7 @@ class IocModel(Base):
     value = Column(Text, nullable=False)
     value_hash = Column(String(64), nullable=False, index=True)
     first_seen = Column(DateTime, default=utc_now)
-    last_seen = Column(DateTime, default=utc_now, onupdate=utc_now)
+    last_seen = Column(DateTime, default=utc_now)
 
     occurrences = relationship("IocOccurrenceModel", back_populates="ioc", lazy="dynamic")
 
@@ -444,6 +444,7 @@ class IocRelationshipModel(Base):
     target_ioc_id = Column(Integer, ForeignKey("iocs.id", ondelete="CASCADE"), nullable=False)
     relationship_type = Column(String(30), nullable=False)
     confidence = Column(Float, default=1.0)
+    created_at = Column(DateTime, default=utc_now, nullable=False)
 
 
 # ===========================================================================
@@ -528,7 +529,7 @@ class CampaignModel(Base):
     name = Column(String(200), nullable=False, unique=True)
     target_brand = Column(String(100), nullable=True)
     first_seen = Column(DateTime, default=utc_now, nullable=False)
-    last_seen = Column(DateTime, default=utc_now, nullable=False, onupdate=utc_now)
+    last_seen = Column(DateTime, default=utc_now, nullable=False)
     domain_count = Column(Integer, default=0)
     kit_signature = Column(Text, nullable=True)
     status = Column(String(20), default="active")  # active, dormant, closed
@@ -561,7 +562,7 @@ class ActorModel(Base):
     fingerprint = Column(JSON, nullable=False)
     confidence_score = Column(Float, default=0.0)
     first_seen = Column(DateTime, default=utc_now, nullable=False)
-    last_seen = Column(DateTime, default=utc_now, nullable=False, onupdate=utc_now)
+    last_seen = Column(DateTime, default=utc_now, nullable=False)
     meta = Column(JSON, default=dict)
 
     campaigns = relationship("ActorCampaignModel", back_populates="actor", lazy="dynamic")
