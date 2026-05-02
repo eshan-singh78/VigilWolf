@@ -13,12 +13,28 @@ import re
 import uuid
 from datetime import datetime, timezone, timedelta
 from typing import Optional
+from urllib.parse import urlparse
+
+from sqlalchemy import func
+from sqlalchemy.exc import IntegrityError
 
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Brand detection
 # ---------------------------------------------------------------------------
+
+# Keywords that are too generic or represent infrastructure, not phishing targets.
+_BRAND_DENYLIST = {
+    "google", "cloudflare", "akamai", "amazon", "aws", "azure",
+    "microsoft", "apple", "github", "gitlab", "docker",
+    "npm", "jsdelivr", "unpkg", "cdnjs",
+    "go", "me", "it", "be", "at", "us", "uk", "de", "fr",
+    "my", "tv", "io", "ai", "co",
+}
+
+# Minimum keyword length — keywords shorter than 4 chars match too broadly.
+_BRAND_MIN_LENGTH = 4
 
 # Ordered by specificity — longer keywords first to avoid partial matches.
 BRAND_KEYWORDS: list[tuple[str, str]] = [
@@ -83,44 +99,89 @@ DORMANT_THRESHOLD_DAYS = 14
 
 
 def _detect_brand(domain_urls: list[str]) -> Optional[str]:
-    """Attempt to identify the targeted brand from a list of domain URLs.
+    """Attempt to identify the targeted brand from domain hostnames.
 
-    Scans each URL (case-insensitive) for known brand keywords and returns
-    the first match.  Returns None if no brand keyword is found.
+    Extracts the hostname from each URL and checks for brand keyword
+    matches against the hostname only (not the path/query), reducing
+    false positives from URL paths like /uploads/ or /verify/.
 
-    Args:
-        domain_urls: List of domain URL strings to scan.
-
-    Returns:
-        Uppercased brand label (e.g. "PAYPAL"), or None.
+    Short keywords (< 4 chars) and denylisted infrastructure/generic
+    terms are skipped to prevent false positives.
     """
-    combined = " ".join(domain_urls).lower()
+    hostnames: list[str] = []
+    for url in domain_urls:
+        try:
+            parsed = urlparse(url)
+            hostname = (parsed.hostname or "").lower()
+            if hostname:
+                # Strip www. prefix for matching
+                if hostname.startswith("www."):
+                    hostname = hostname[4:]
+                hostnames.append(hostname)
+        except Exception:
+            continue
+
+    if not hostnames:
+        return None
+
+    combined = " ".join(hostnames)
     for keyword, brand in BRAND_KEYWORDS:
-        # Match keyword as a word boundary to reduce false positives.
-        if re.search(rf"\b{re.escape(keyword)}\b", combined):
+        # Skip short keywords and denylisted terms to reduce false positives.
+        if len(keyword) < _BRAND_MIN_LENGTH or keyword.lower() in _BRAND_DENYLIST:
+            continue
+        # Match keyword as a word boundary within hostname parts.
+        # Hostnames use dots as separators, so match between dots/dashes.
+        pattern = rf"(?:^|[.-]){re.escape(keyword)}(?:[.-]|$)"
+        if re.search(pattern, combined):
             return brand
+
     return None
 
 
 def _generate_campaign_name(brand: str) -> str:
-    """Auto-generate a campaign name in the format BRAND_PHISH_MMDD.
+    """Auto-generate a campaign name in the format BRAND_PHISH_YYYYWNN.
 
-    Uses the current UTC date for the MMDD suffix.
+    Uses the ISO week number for the date suffix, so campaigns targeting the
+    same brand within the same week share a name base (the uniqueness loop
+    appends _1, _2 etc. if needed).
 
     Args:
         brand: Uppercased brand label.
 
     Returns:
-        Campaign name string, e.g. "PAYPAL_PHISH_0428".
+        Campaign name string, e.g. "PAYPAL_PHISH_2026W18".
     """
     now = datetime.now(timezone.utc)
-    date_suffix = now.strftime("%m%d")
-    return f"{brand}_PHISH_{date_suffix}"
+    iso_year, iso_week, _ = now.isocalendar()
+    return f"{brand}_PHISH_{iso_year}W{iso_week:02d}"
 
 
 # ---------------------------------------------------------------------------
 # Campaign detection
 # ---------------------------------------------------------------------------
+
+
+def _recompute_domain_count(campaign, session) -> int:
+    """Recompute and persist the domain_count from all linked clusters.
+
+    Counts distinct domain IDs across every cluster linked to the campaign,
+    then writes the result back to ``campaign.domain_count`` and returns it.
+    """
+    from database import (  # type: ignore[import-untyped]
+        CampaignClusterModel,
+        ClusterMemberModel,
+        ClusterModel,
+    )
+
+    domain_count_result = (
+        session.query(func.count(func.distinct(ClusterMemberModel.domain_id)))
+        .join(ClusterModel, ClusterMemberModel.cluster_id == ClusterModel.id)
+        .join(CampaignClusterModel, CampaignClusterModel.cluster_id == ClusterModel.id)
+        .filter(CampaignClusterModel.campaign_id == campaign.id)
+        .scalar()
+    )
+    campaign.domain_count = domain_count_result or 0
+    return campaign.domain_count
 
 
 def detect_campaigns(session) -> dict:
@@ -193,17 +254,23 @@ def detect_campaigns(session) -> dict:
                 )
                 continue
 
-            campaign.domain_count = cluster.domain_count
+            _recompute_domain_count(campaign, session)
             campaign.last_seen = cluster.last_seen
 
-            # Determine dormancy: if the cluster has not seen new domains
-            # recently, mark the campaign as dormant.
+            # Determine dormancy or re-activation.
             dormant_cutoff = datetime.now(timezone.utc) - timedelta(days=DORMANT_THRESHOLD_DAYS)
             if cluster.last_seen < dormant_cutoff and campaign.status == "active":
                 campaign.status = "dormant"
                 logger.info(
                     "Campaign %s (%s) marked dormant — no new domains since %s",
                     campaign.id, campaign.name, cluster.last_seen.isoformat(),
+                )
+            elif cluster.last_seen >= dormant_cutoff and campaign.status == "dormant":
+                campaign.status = "active"
+                _recompute_domain_count(campaign, session)
+                logger.info(
+                    "Campaign %s (%s) re-activated — new domains detected",
+                    campaign.id, campaign.name,
                 )
 
             campaigns_updated += 1
@@ -226,6 +293,52 @@ def detect_campaigns(session) -> dict:
             )
             domain_urls = [d.url for d in member_rows]
             brand = _detect_brand(domain_urls) or "UNKNOWN"
+
+            # Check for an existing active campaign targeting the same brand.
+            existing_brand_campaign = (
+                session.query(CampaignModel)
+                .filter(
+                    CampaignModel.target_brand == brand,
+                    CampaignModel.status.in_(["active", "dormant"]),
+                )
+                .order_by(CampaignModel.last_seen.desc())
+                .first()
+            )
+
+            if existing_brand_campaign is not None:
+                # Link this cluster to the existing campaign instead of creating a new one.
+                try:
+                    with session.begin_nested():
+                        link = CampaignClusterModel(
+                            campaign_id=existing_brand_campaign.id,
+                            cluster_id=cluster.id,
+                        )
+                        session.add(link)
+                        session.flush()
+                except Exception:
+                    logger.debug(
+                        "Cluster %s already linked to campaign %s",
+                        cluster.id[:8], existing_brand_campaign.id[:8],
+                    )
+                _recompute_domain_count(existing_brand_campaign, session)
+                existing_brand_campaign.last_seen = max(
+                    existing_brand_campaign.last_seen or datetime.now(timezone.utc),
+                    cluster.last_seen or datetime.now(timezone.utc),
+                )
+                # Re-activate if dormant
+                if existing_brand_campaign.status == "dormant":
+                    existing_brand_campaign.status = "active"
+                    logger.info(
+                        "Re-activated campaign %s (%s) for brand %s with new cluster",
+                        existing_brand_campaign.id[:8], existing_brand_campaign.name, brand,
+                    )
+                campaigns_updated += 1
+                logger.debug(
+                    "Linked cluster %s to existing campaign %s (brand=%s)",
+                    cluster.id[:8], existing_brand_campaign.id[:8], brand,
+                )
+                continue
+
             campaign_name = _generate_campaign_name(brand)
 
             # Ensure name uniqueness — append a short suffix if collision.
@@ -241,32 +354,54 @@ def detect_campaigns(session) -> dict:
                 suffix += 1
 
             campaign_id = str(uuid.uuid4())
-            campaign = CampaignModel(
-                id=campaign_id,
-                name=name,
-                target_brand=brand,
-                first_seen=cluster.first_seen,
-                last_seen=cluster.last_seen,
-                domain_count=cluster.domain_count,
-                kit_signature=cluster.signature_hash,
-                status="active",
-                meta={"source_cluster_type": cluster.cluster_type},
-            )
-            session.add(campaign)
-            session.flush()  # ensure campaign.id is available
+            try:
+                with session.begin_nested():
+                    campaign = CampaignModel(
+                        id=campaign_id,
+                        name=name,
+                        target_brand=brand,
+                        first_seen=cluster.first_seen,
+                        last_seen=cluster.last_seen,
+                        domain_count=0,  # placeholder; recomputed below
+                        kit_signature=cluster.signature_hash,
+                        status="active",
+                        meta={"source_cluster_type": cluster.cluster_type},
+                    )
+                    session.add(campaign)
+                    session.flush()  # ensure campaign.id is available
 
-            # Link the cluster to the campaign.
-            link = CampaignClusterModel(
-                campaign_id=campaign.id,
-                cluster_id=cluster.id,
-            )
-            session.add(link)
+                    # Link the cluster to the campaign.
+                    link = CampaignClusterModel(
+                        campaign_id=campaign.id,
+                        cluster_id=cluster.id,
+                    )
+                    session.add(link)
 
-            campaigns_created += 1
-            logger.info(
-                "Created campaign %s (%s): brand=%s, domain_count=%d",
-                campaign.id, campaign.name, brand, campaign.domain_count,
-            )
+                # Recompute domain_count from all linked clusters.
+                _recompute_domain_count(campaign, session)
+
+                campaigns_created += 1
+                logger.info(
+                    "Created campaign %s (%s): brand=%s, domain_count=%d",
+                    campaign.id, campaign.name, brand, campaign.domain_count,
+                )
+            except IntegrityError:
+                # Concurrent worker beat us to this campaign name — look it up instead.
+                campaign = (
+                    session.query(CampaignModel)
+                    .filter(CampaignModel.name == name)
+                    .first()
+                )
+                if campaign is None:
+                    logger.error(
+                        "IntegrityError on campaign name %s but lookup returned None; skipping.",
+                        name,
+                    )
+                    continue
+                logger.info(
+                    "Campaign %s (%s) already existed (concurrent create); re-using.",
+                    campaign.id, campaign.name,
+                )
 
     session.flush()
     logger.info(

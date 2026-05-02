@@ -5,7 +5,10 @@ relationship building for IOCs extracted by the ioc_extractor plugin.
 """
 from __future__ import annotations
 
+import hashlib
+import ipaddress
 import logging
+import re
 from datetime import datetime, timezone
 from typing import Optional
 from urllib.parse import urlparse
@@ -20,6 +23,42 @@ def _escape_like(q: str) -> str:
     """Escape SQL LIKE wildcards (% and _) in user input."""
     return q.replace("%", "\\%").replace("_", "\\_")
 
+
+def _normalize_ioc_value(ioc_type: str, value: str) -> str:
+    """Normalize IOC values for dedup: lowercase domains/emails/URLs,
+    strip leading zeros from IPs, normalize IPv6, normalize Telegram
+    handles, lowercase URL path components (preserving query values)."""
+    value = value.strip()
+    if not value:
+        return value
+    if ioc_type in ("domain", "email"):
+        return value.lower()
+    if ioc_type == "url":
+        parsed = urlparse(value)
+        if parsed.hostname:
+            normalized_netloc = parsed.hostname.lower()
+            if parsed.port:
+                normalized_netloc = f"{normalized_netloc}:{parsed.port}"
+            # Lowercase path segments but preserve query parameter values
+            normalized_path = parsed.path.lower()
+            return parsed._replace(netloc=normalized_netloc, path=normalized_path).geturl()
+        return value.lower()
+    if ioc_type == "ip":
+        # IPv6: use ipaddress module for full normalization
+        if ":" in value:
+            try:
+                return str(ipaddress.ip_address(value))
+            except ValueError:
+                return value.lower()
+        # IPv4: strip leading zeros from each octet (e.g., 192.168.001.001 -> 192.168.1.1)
+        parts = value.split(".")
+        if len(parts) == 4:
+            return ".".join(str(int(p)) for p in parts)
+    if ioc_type == "telegram":
+        # Strip leading @ and lowercase
+        return value.lstrip("@").lower()
+    return value
+
 # ---------------------------------------------------------------------------
 # Type mapping: findings key -> IocModel.type value
 # ---------------------------------------------------------------------------
@@ -32,6 +71,9 @@ _IOC_TYPE_MAP = {
     "telegram_handles": "telegram",
     "crypto_wallets": "wallet",
 }
+
+# Maximum same_page relationships per snapshot to prevent O(n^2) explosion.
+MAX_SAME_PAGE_RELATIONSHIPS = 50
 
 # ---------------------------------------------------------------------------
 # Role classification constants
@@ -48,6 +90,22 @@ _CDN_KEYWORDS = (
     "amazonaws",
     "jsdelivr",
     "unpkg",
+)
+
+_LEGITIMATE_LOGIN_DOMAINS = (
+    "login.microsoftonline.com",
+    "login.salesforce.com",
+    "accounts.google.com",
+    "signin.aws.amazon.com",
+    "auth0.com",
+    "okta.com",
+    "onelogin.com",
+    "pingidentity.com",
+    "login.live.com",
+    "login.yahoo.com",
+    "login.apple.com",
+    "login.twitter.com",
+    "login.linkedin.com",
 )
 
 _TRACKING_PIXEL_KEYWORDS = (
@@ -80,6 +138,12 @@ def _classify_url_role(url: str) -> str:
     """
     url_lower = url.lower()
 
+    # Check if URL is on a known legitimate login/SSO domain
+    parsed = urlparse(url)
+    hostname = (parsed.hostname or "").lower()
+    if any(hostname == domain or hostname.endswith("." + domain) for domain in _LEGITIMATE_LOGIN_DOMAINS):
+        return "resource"
+
     # Exfiltration endpoints: POST actions, form submissions
     if any(sig in url_lower for sig in ("post", "submit", "form", "login", "upload", "send", "api/login", "api/submit")):
         return "exfil_endpoint"
@@ -88,9 +152,7 @@ def _classify_url_role(url: str) -> str:
     if any(kw in url_lower for kw in _TRACKING_PIXEL_KEYWORDS):
         return "tracking"
 
-    # CDN / static asset hosts
-    parsed = urlparse(url)
-    hostname = (parsed.hostname or "").lower()
+    # CDN / static asset hosts (parsed/hostname already computed above)
     if any(kw in hostname for kw in _CDN_KEYWORDS):
         return "cdn"
 
@@ -201,87 +263,115 @@ def persist_iocs(
     snapshot_ioc_ids: list[int] = []
 
     for findings_key, ioc_type in _IOC_TYPE_MAP.items():
-        values = findings.get(findings_key, [])
-        if not values:
+        raw_values = findings.get(findings_key) or []
+        if not raw_values:
             continue
 
-        for value in values:
+        for value in raw_values:
+            if value is None:
+                continue
             value = value.strip()
             if not value:
                 continue
 
-            # Dedup: find existing or create new IocModel
-            existing = (
-                session.query(IocModel)
-                .filter(IocModel.value == value)
-                .first()
-            )
+            # Dedup: find existing or create new IocModel (savepoint for concurrent safety)
+            normalized = _normalize_ioc_value(ioc_type, value)
+            value_hash = hashlib.sha256(normalized.encode("utf-8")).hexdigest()
 
-            if existing is None:
-                ioc = IocModel(
-                    type=ioc_type,
-                    value=value,
-                    first_seen=now,
-                    last_seen=now,
+            try:
+                with session.begin_nested():
+                    existing_check = (
+                        session.query(IocModel)
+                        .filter(IocModel.value_hash == value_hash)
+                        .first()
+                    )
+                    if existing_check is None:
+                        ioc = IocModel(
+                            type=ioc_type,
+                            value=normalized,
+                            value_hash=value_hash,
+                            first_seen=now,
+                            last_seen=now,
+                        )
+                        session.add(ioc)
+                        session.flush()
+                        iocs_persisted += 1
+                        ioc_id = ioc.id
+                    else:
+                        existing_check.last_seen = now
+                        ioc_id = existing_check.id
+            except Exception:
+                # IntegrityError from concurrent insert — query the existing row
+                logger.debug("IOC value already exists: %s", normalized[:50])
+                existing = (
+                    session.query(IocModel)
+                    .filter(IocModel.value_hash == value_hash)
+                    .first()
                 )
-                session.add(ioc)
-                session.flush()  # assign ioc.id
-                iocs_persisted += 1
-                ioc_id = ioc.id
-            else:
-                # Update last_seen timestamp
+                if existing is None:
+                    # Shouldn't happen, but skip if it does
+                    continue
                 existing.last_seen = now
                 ioc_id = existing.id
 
             snapshot_ioc_ids.append(ioc_id)
 
-            # Create occurrence linking IOC to this snapshot
-            role = _classify_role(ioc_type, value)
-            context = _infer_context(ioc_type, value)
+            # Create occurrence linking IOC to this snapshot (idempotent via unique constraint)
+            role = _classify_role(ioc_type, normalized)
+            context = _infer_context(ioc_type, normalized)
 
-            occurrence = IocOccurrenceModel(
-                ioc_id=ioc_id,
-                snapshot_id=snapshot_id,
-                context=context,
-                confidence=1.0,
-                role=role,
-                created_at=now,
-            )
-            session.add(occurrence)
-            occurrences_created += 1
+            try:
+                with session.begin_nested():
+                    occurrence = IocOccurrenceModel(
+                        ioc_id=ioc_id,
+                        snapshot_id=snapshot_id,
+                        context=context,
+                        confidence=1.0,
+                        role=role,
+                        created_at=now,
+                    )
+                    session.add(occurrence)
+                    session.flush()
+                occurrences_created += 1
+            except Exception:
+                logger.debug("IOC occurrence already exists: ioc_id=%d snapshot=%s", ioc_id, snapshot_id)
 
     # Build relationships -------------------------------------------------
 
-    # same_page: pairwise between all IOCs found in this snapshot
-    # Avoid creating duplicates by only creating (a,b) where a < b.
+    # same_page: pairwise between all IOCs found in this snapshot.
+    # Cap at MAX_SAME_PAGE_RELATIONSHIPS to prevent O(n^2) explosion.
     if len(snapshot_ioc_ids) >= 2:
         sorted_ids = sorted(set(snapshot_ioc_ids))
-        for i in range(len(sorted_ids)):
-            for j in range(i + 1, len(sorted_ids)):
-                src_id = sorted_ids[i]
-                tgt_id = sorted_ids[j]
+        pairs = [
+            (sorted_ids[i], sorted_ids[j])
+            for i in range(len(sorted_ids))
+            for j in range(i + 1, len(sorted_ids))
+        ]
+        # Cap total relationships per snapshot
+        if len(pairs) > MAX_SAME_PAGE_RELATIONSHIPS:
+            logger.info(
+                "Capping same_page relationships for snapshot %s: %d -> %d",
+                snapshot_id, len(pairs), MAX_SAME_PAGE_RELATIONSHIPS,
+            )
+            pairs = pairs[:MAX_SAME_PAGE_RELATIONSHIPS]
 
-                # Check if relationship already exists
-                exists = (
-                    session.query(IocRelationshipModel)
-                    .filter(
-                        IocRelationshipModel.source_ioc_id == src_id,
-                        IocRelationshipModel.target_ioc_id == tgt_id,
-                        IocRelationshipModel.relationship_type == "same_page",
+        for src_id, tgt_id in pairs:
+            try:
+                with session.begin_nested():
+                    rel = IocRelationshipModel(
+                        source_ioc_id=src_id,
+                        target_ioc_id=tgt_id,
+                        relationship_type="same_page",
+                        confidence=0.7,
                     )
-                    .first()
-                )
-                if exists:
-                    continue
-
-                rel = IocRelationshipModel(
-                    source_ioc_id=src_id,
-                    target_ioc_id=tgt_id,
-                    relationship_type="same_page",
-                    confidence=0.7,
-                )
-                session.add(rel)
+                    session.add(rel)
+                    session.flush()
                 relationships_created += 1
+            except Exception:
+                logger.debug(
+                    "IOC relationship already exists: %d -> %d (same_page)",
+                    src_id, tgt_id,
+                )
 
     # script_load: script src URLs are linked to the domain they are loaded on
     url_ioc_ids = []
@@ -309,27 +399,22 @@ def persist_iocs(
             if domain_ioc is None:
                 continue
             if domain_ioc.value.lower() == domain_host:
-                # Check if script_load relationship already exists
-                exists = (
-                    session.query(IocRelationshipModel)
-                    .filter(
-                        IocRelationshipModel.source_ioc_id == domain_id,
-                        IocRelationshipModel.target_ioc_id == url_id,
-                        IocRelationshipModel.relationship_type == "script_load",
+                try:
+                    with session.begin_nested():
+                        rel = IocRelationshipModel(
+                            source_ioc_id=domain_id,
+                            target_ioc_id=url_id,
+                            relationship_type="script_load",
+                            confidence=0.9,
+                        )
+                        session.add(rel)
+                        session.flush()
+                    relationships_created += 1
+                except Exception:
+                    logger.debug(
+                        "IOC relationship already exists: %d -> %d (script_load)",
+                        domain_id, url_id,
                     )
-                    .first()
-                )
-                if exists:
-                    continue
-
-                rel = IocRelationshipModel(
-                    source_ioc_id=domain_id,
-                    target_ioc_id=url_id,
-                    relationship_type="script_load",
-                    confidence=0.9,
-                )
-                session.add(rel)
-                relationships_created += 1
 
     session.flush()
 

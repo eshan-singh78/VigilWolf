@@ -23,6 +23,7 @@ from sqlalchemy import (
     DateTime,
     Float,
     ForeignKey,
+    Index,
     Integer,
     String,
     Text,
@@ -31,6 +32,7 @@ from sqlalchemy import (
     create_engine,
     event,
     inspect,
+    text,
 )
 from sqlalchemy.orm import DeclarativeBase, relationship, sessionmaker, Session
 from sqlalchemy.pool import StaticPool
@@ -275,6 +277,7 @@ class AnalysisResultModel(Base):
 
     __table_args__ = (
         UniqueConstraint("snapshot_id", "plugin_name", name="uq_analysis_snapshot_plugin"),
+        Index('ix_analysis_result_plugin_snapshot', 'plugin_name', 'snapshot_id'),
     )
 
     # relationships
@@ -395,10 +398,14 @@ class AuditLogModel(Base):
 class IocModel(Base):
     """Deduplicated indicator of compromise."""
     __tablename__ = "iocs"
+    __table_args__ = (
+        UniqueConstraint("value_hash", name="uq_ioc_value_hash"),
+    )
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     type = Column(String(20), nullable=False)  # domain, ip, url, email, telegram, wallet, phone
-    value = Column(Text, nullable=False, unique=True)
+    value = Column(Text, nullable=False)
+    value_hash = Column(String(64), nullable=False, index=True)
     first_seen = Column(DateTime, default=utc_now)
     last_seen = Column(DateTime, default=utc_now, onupdate=utc_now)
 
@@ -408,6 +415,9 @@ class IocModel(Base):
 class IocOccurrenceModel(Base):
     """A specific appearance of an IOC in a snapshot."""
     __tablename__ = "ioc_occurrences"
+    __table_args__ = (
+        UniqueConstraint("ioc_id", "snapshot_id", name="uq_ioc_occurrence_snapshot"),
+    )
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     ioc_id = Column(Integer, ForeignKey("iocs.id", ondelete="CASCADE"), nullable=False)
@@ -424,6 +434,9 @@ class IocOccurrenceModel(Base):
 class IocRelationshipModel(Base):
     """Relationship between two IOCs (same_page, redirect, script_load, shared_hosting)."""
     __tablename__ = "ioc_relationships"
+    __table_args__ = (
+        UniqueConstraint("source_ioc_id", "target_ioc_id", "relationship_type", name="uq_ioc_relationship"),
+    )
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     source_ioc_id = Column(Integer, ForeignKey("iocs.id", ondelete="CASCADE"), nullable=False)
@@ -439,6 +452,9 @@ class IocRelationshipModel(Base):
 class ClusterModel(Base):
     """A group of related domains (HTML similarity, infrastructure, phishkit, campaign)."""
     __tablename__ = "clusters"
+    __table_args__ = (
+        UniqueConstraint("cluster_type", "signature_hash", "signature_type", name="uq_cluster_signature"),
+    )
 
     id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
     cluster_type = Column(String(30), nullable=False)  # html_similarity, infra, phishkit, campaign
@@ -476,9 +492,12 @@ class ClusterMemberModel(Base):
 class PhishkitModel(Base):
     """A detected phishing kit identified by JS/DOM signature."""
     __tablename__ = "phishkits"
+    __table_args__ = (
+        UniqueConstraint("signature_hash", name="uq_phishkit_signature"),
+    )
 
     id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
-    signature_hash = Column(Text, unique=True)
+    signature_hash = Column(Text, nullable=False)
     panel_path = Column(Text, nullable=True)
     exfil_endpoint = Column(Text, nullable=True)
     meta = Column(JSON, default=dict)
@@ -557,6 +576,23 @@ class ActorCampaignModel(Base):
     campaign = relationship("CampaignModel")
 
 
+class C2CandidateModel(Base):
+    """A C2 candidate identified by the intelligence pipeline."""
+    __tablename__ = "c2_candidates"
+    __table_args__ = (
+        UniqueConstraint("ioc_id", "snapshot_id", name="uq_c2_candidate_snapshot"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    ioc_id = Column(Integer, ForeignKey("iocs.id", ondelete="CASCADE"), nullable=False)
+    snapshot_id = Column(String(36), ForeignKey("snapshots.id", ondelete="CASCADE"), nullable=True)
+    c2_score = Column(Float, nullable=False)
+    signals = Column(JSON, default=list)
+    detected_at = Column(DateTime, default=utc_now, nullable=False)
+
+    ioc = relationship("IocModel")
+
+
 # ---------------------------------------------------------------------------
 # Engine & Session helpers
 # ---------------------------------------------------------------------------
@@ -629,6 +665,47 @@ def init_db(engine=None):
     if engine is None:
         engine = get_engine()
     Base.metadata.create_all(bind=engine)
+
+
+def check_required_tables(required_tables: list[str], engine=None) -> tuple[bool, list[str]]:
+    """Return whether *required_tables* exist, plus any missing table names."""
+    if engine is None:
+        engine = get_engine()
+    inspector = inspect(engine)
+    existing = set(inspector.get_table_names())
+    missing = [name for name in required_tables if name not in existing]
+    return (len(missing) == 0, missing)
+
+
+def verify_production_schema(engine=None) -> None:
+    """Fail fast when production database schema is not migration-ready."""
+    if engine is None:
+        engine = get_engine()
+
+    # Core tables needed for API startup + plugin seeding.
+    required = [
+        "alembic_version",
+        "groups",
+        "domains",
+        "snapshots",
+        "plugin_weights",
+    ]
+    ok, missing = check_required_tables(required, engine=engine)
+    if not ok:
+        raise RuntimeError(
+            "Production DB schema is not ready. Missing tables: "
+            + ", ".join(sorted(missing))
+            + ". Run `alembic upgrade head` before starting the API."
+        )
+
+    # Ensure alembic_version has at least one row.
+    with engine.connect() as conn:
+        row = conn.execute(text("SELECT version_num FROM alembic_version LIMIT 1")).fetchone()
+        if row is None or not row[0]:
+            raise RuntimeError(
+                "Production DB schema is not migration-tracked "
+                "(alembic_version is empty). Run `alembic upgrade head`."
+            )
 
 
 def reset_db(engine=None):

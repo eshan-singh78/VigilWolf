@@ -2,6 +2,8 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, APIRouter, Depends
 from fastapi.middleware.cors import CORSMiddleware
+from starlette.middleware.trustedhost import TrustedHostMiddleware
+from starlette.middleware.httpsredirect import HTTPSRedirectMiddleware
 
 from middleware.auth import verify_api_key
 from middleware.rate_limit import RateLimitMiddleware
@@ -54,15 +56,28 @@ if config.ENABLE_PROMETHEUS:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Startup: seed default plugin weights into the database."""
-    from database import init_db
+    from database import init_db, verify_production_schema
     from seed_weights import seed_weights
 
-    init_db()
+    if config.ENVIRONMENT == "production":
+        if not config.API_KEY:
+            raise RuntimeError(
+                "FATAL: API_KEY is not set in production. "
+                "Set the API_KEY environment variable before starting the server."
+            )
+        verify_production_schema()
+    else:
+        init_db()
     seed_weights()
     yield
 
 
 app = FastAPI(title="VigilWolf v2", version="2.0.0", lifespan=lifespan)
+
+if config.TRUSTED_HOSTS:
+    app.add_middleware(TrustedHostMiddleware, allowed_hosts=config.TRUSTED_HOSTS)
+if config.FORCE_HTTPS:
+    app.add_middleware(HTTPSRedirectMiddleware)
 
 # CORS — allow frontend origin(s) configured via ALLOWED_ORIGINS
 app.add_middleware(
@@ -91,14 +106,9 @@ v2_router.include_router(iocs_router)
 v2_router.include_router(clusters_router)
 v2_router.include_router(campaigns_router)
 v2_router.include_router(actors_router)
+v2_router.include_router(events_router)
 
 app.include_router(v2_router)
-
-# Events SSE endpoint — mounted outside v2_router so it does NOT require
-# API-key auth (browsers' EventSource cannot set custom headers).
-events_router_auth_free = APIRouter(prefix="/api/v2")
-events_router_auth_free.include_router(events_router)
-app.include_router(events_router_auth_free)
 
 
 @app.get("/health")

@@ -135,19 +135,13 @@ def test_run_pipeline_continues_after_stage_error(mock_config, mock_emit):
     mock_get_session.return_value.__enter__ = MagicMock(return_value=mock_session)
     mock_get_session.return_value.__exit__ = MagicMock(return_value=False)
 
-    mock_cluster_structural = MagicMock(side_effect=RuntimeError("DB error"))
-    mock_cluster_infra = MagicMock(side_effect=RuntimeError("DB error"))
-    mock_detect_campaigns = MagicMock(return_value={"campaigns_created": 1, "campaigns_updated": 0})
+    mock_cluster_snapshot = MagicMock(side_effect=RuntimeError("DB error"))
+    mock_detect_campaigns_for_snapshot = MagicMock(return_value=2)
 
     with patch.dict(sys.modules, {
         "database": MagicMock(get_session=mock_get_session),
-        "services.clustering_service": MagicMock(
-            cluster_by_structural_hash=mock_cluster_structural,
-            cluster_by_infrastructure=mock_cluster_infra,
-        ),
-        "services.campaign_service": MagicMock(
-            detect_campaigns=mock_detect_campaigns,
-        ),
+        "services.clustering_service": MagicMock(cluster_snapshot=mock_cluster_snapshot),
+        "services.campaign_service": MagicMock(detect_campaigns_for_snapshot=mock_detect_campaigns_for_snapshot),
     }):
         from intelligence_worker import run_intelligence_pipeline
 
@@ -155,7 +149,6 @@ def test_run_pipeline_continues_after_stage_error(mock_config, mock_emit):
 
     # Clustering should have logged errors, but pipeline should continue.
     assert result is not None
-    assert result["stages"]["clustering_structural"] == {"error": True}
-    assert result["stages"]["clustering_infra"] == {"error": True}
-    assert result["stages"]["campaign_detection"] == {"campaigns_created": 1, "campaigns_updated": 0}
+    assert result["stages"]["clustering"] == {"error": True}
+    assert result["stages"]["campaign_detection"] == {"campaigns_created_or_updated": 2}
     mock_emit.assert_called_once()

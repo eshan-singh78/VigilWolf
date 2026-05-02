@@ -20,6 +20,7 @@ import requests
 
 from config import ALERTS_DRY_RUN, ALERTS_ENABLED
 from plugins.base import SnapshotContext
+from plugins.capture_engine import validate_capture_url, CaptureError
 
 logger = logging.getLogger(__name__)
 
@@ -322,6 +323,27 @@ class AlertService:
         from database import AlertModel  # type: ignore[import-untyped]
 
         body_bytes = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+        try:
+            validate_capture_url(webhook.url)
+        except CaptureError as exc:
+            alert = AlertModel(
+                event_type=payload["event"],
+                dedup_key=payload["dedup_key"],
+                domain_id=ctx.snapshot_record.get("domain_id") if ctx.snapshot_record else None,
+                snapshot_id=ctx.snapshot_id,
+                risk_level=score_outcome.get("risk_level"),
+                severity=score_outcome.get("severity", "low"),
+                score=score_outcome.get("score", 0),
+                webhook_id=webhook.id,
+                payload=payload,
+                payload_version="1.0",
+                status="failed",
+                attempts=0,
+            )
+            session.add(alert)
+            session.commit()
+            logger.warning("Skipping webhook %s due to invalid URL: %s", webhook.id, exc)
+            return
 
         headers = {"Content-Type": "application/json"}
         if webhook.secret:

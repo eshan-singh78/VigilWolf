@@ -20,6 +20,7 @@ RUN playwright install --with-deps chromium
 
 # Copy application code
 COPY . .
+RUN chmod +x /app/entrypoint.sh
 
 # Create monitoring data directory and set ownership
 RUN mkdir -p /app/monitoring_data && chown -R appuser:appuser /app
@@ -28,4 +29,5 @@ USER appuser
 
 EXPOSE 8000
 
+ENTRYPOINT ["/app/entrypoint.sh"]
 CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
