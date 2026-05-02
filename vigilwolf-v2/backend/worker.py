@@ -34,6 +34,7 @@ logger = logging.getLogger(__name__)
 # every RECONCILIATION_INTERVAL_S regardless of pipeline activity.
 # ---------------------------------------------------------------------------
 RECONCILIATION_INTERVAL_S = 15 * 60  # 15 minutes
+MAX_HTML_SIZE = 10 * 1024 * 1024  # 10 MB — reject HTML payloads larger than this
 
 
 # ---------------------------------------------------------------------------
@@ -357,6 +358,10 @@ def capture_domain(domain_id: str, url: str, trigger_type: str = "nrd_ingest") -
             return None
         html = capture_result["html"]
 
+        if len(html.encode("utf-8", errors="replace")) > MAX_HTML_SIZE:
+            logger.error("HTML too large (%d bytes) for url=%s; skipping.", len(html.encode("utf-8", errors="replace")), url)
+            return None
+
         # Step 2 — SHA-256
         sha256 = hashlib.sha256(html.encode("utf-8", errors="replace")).hexdigest()
 
@@ -364,33 +369,16 @@ def capture_domain(domain_id: str, url: str, trigger_type: str = "nrd_ingest") -
         from database import get_session, SnapshotModel
         from sqlalchemy.exc import IntegrityError
 
-        # Step 3a — Save to storage (file I/O, outside DB session)
         snapshot_id = str(uuid.uuid4())
         snapshot_record_dict = {
             "id": snapshot_id,
             "domain_id": domain_id,
         }
 
-        try:
-            from plugins.storage_manager import save_snapshot  # type: ignore[import-untyped]
-            save_result = save_snapshot(
-                domain_id=domain_id,
-                snapshot_id=snapshot_id,
-                html=html,
-            )
-            html_path = save_result.get("html_path", "") if save_result else ""
-        except ImportError as exc:
-            if config.ENVIRONMENT == "production":
-                raise RuntimeError("storage_manager module missing in production") from exc
-            logger.warning("storage_manager not available; saving html_path as empty string.")
-            html_path = ""
-
-        if config.ENVIRONMENT == "production" and not html_path:
-            raise RuntimeError("storage_manager returned empty html_path in production")
-
-        # Step 3b — Duplicate check + insert in one session (prevents race condition
+        # Duplicate check + insert in one session (prevents race condition
         # where a concurrent worker inserts the same snapshot between the check and
-        # the insert, causing a silent IntegrityError loss)
+        # the insert, causing a silent IntegrityError loss). Storage save is
+        # deferred until after uniqueness is confirmed to avoid orphaned files.
         with get_session() as session:
             existing = (
                 session.query(SnapshotModel)
@@ -411,7 +399,7 @@ def capture_domain(domain_id: str, url: str, trigger_type: str = "nrd_ingest") -
                         domain_id=domain_id,
                         timestamp=datetime.now(timezone.utc),
                         trigger_type=trigger_type,
-                        html_path=html_path,
+                        html_path="",
                         sha256=sha256,
                         size_bytes=len(html.encode("utf-8", errors="replace")),
                         success=True,
@@ -433,6 +421,25 @@ def capture_domain(domain_id: str, url: str, trigger_type: str = "nrd_ingest") -
                     return existing.id
                 raise
 
+            # NOW save to storage (after we know the snapshot is unique)
+            try:
+                from plugins.storage_manager import save_snapshot as _save_snapshot  # type: ignore[import-untyped]
+                save_result = _save_snapshot(
+                    domain_id=domain_id,
+                    snapshot_id=snapshot_id,
+                    html=html,
+                )
+                html_path = save_result.get("html_path", "") if save_result else ""
+            except ImportError:
+                if config.ENVIRONMENT == "production":
+                    raise RuntimeError("storage_manager module missing in production")
+                html_path = ""
+
+            if config.ENVIRONMENT == "production" and not html_path:
+                raise RuntimeError("storage_manager returned empty html_path in production")
+
+            # Update snapshot html_path
+            snapshot.html_path = html_path
             session.commit()
 
         # Step 5 — Build context and analyze (sync or Dramatiq)
@@ -719,24 +726,28 @@ def aggregate_results(ctx: SnapshotContext, results: list[PluginResult]) -> dict
         score_outcome["severity"] = "critical"
         score_outcome["risk_level"] = "high"
 
-    # Persist RiskScoreModel
-    try:
-        with get_session() as session:
-            risk_score = RiskScoreModel(
-                snapshot_id=ctx.snapshot_id,
-                total_score=score_outcome["score"],
-                normalized_score=score_outcome["normalized_score"],
-                risk_level=score_outcome["risk_level"],
-                severity=score_outcome["severity"],
-                reasons=score_outcome["reasons"],
-                dominant_signals=score_outcome["dominant_signals"],
-                plugin_breakdown=score_outcome["plugin_breakdown"],
-                overall_confidence=score_outcome["overall_confidence"],
-            )
-            session.add(risk_score)
+    # Persist RiskScoreModel (savepoint isolates the insert so an
+    # IntegrityError doesn't lose the entire session state)
+    with get_session() as session:
+        try:
+            with session.begin_nested():
+                risk_score = RiskScoreModel(
+                    snapshot_id=ctx.snapshot_id,
+                    total_score=score_outcome["score"],
+                    normalized_score=score_outcome["normalized_score"],
+                    risk_level=score_outcome["risk_level"],
+                    severity=score_outcome["severity"],
+                    reasons=score_outcome["reasons"],
+                    dominant_signals=score_outcome["dominant_signals"],
+                    plugin_breakdown=score_outcome["plugin_breakdown"],
+                    overall_confidence=score_outcome["overall_confidence"],
+                )
+                session.add(risk_score)
+                session.flush()
+        except Exception:
+            logger.exception("Failed to persist RiskScoreModel for snapshot_id=%s", ctx.snapshot_id)
+        else:
             session.commit()
-    except Exception:
-        logger.exception("Failed to persist RiskScoreModel for snapshot_id=%s", ctx.snapshot_id)
 
     # Publish threat_detected event for SSE streaming
     if score_outcome["risk_level"] in ("high", "medium"):
