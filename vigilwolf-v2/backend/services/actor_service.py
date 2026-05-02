@@ -279,23 +279,38 @@ def profile_actors(session) -> dict:
         SnapshotModel,
     )
 
-    # Pre-load campaign -> cluster IDs
+    # Pre-load campaign -> cluster IDs (filtered to our campaigns only)
     campaign_cluster_map: dict[str, set[str]] = {}
-    all_cluster_links = session.query(CampaignClusterModel).all()
-    for link in all_cluster_links:
-        campaign_cluster_map.setdefault(link.campaign_id, set()).add(link.cluster_id)
+    campaign_ids = {c.id for c in campaigns}
+    if campaign_ids:
+        all_cluster_links = session.query(CampaignClusterModel).filter(
+            CampaignClusterModel.campaign_id.in_(campaign_ids)
+        ).all()
+        for link in all_cluster_links:
+            campaign_cluster_map.setdefault(link.campaign_id, set()).add(link.cluster_id)
 
-    # Pre-load cluster types for infra filtering
+    # Collect all cluster IDs referenced by our campaigns
+    relevant_cluster_ids: set[str] = set()
+    for cluster_ids in campaign_cluster_map.values():
+        relevant_cluster_ids.update(cluster_ids)
+
+    # Pre-load cluster types for relevant clusters only
     cluster_type_map: dict[str, str] = {}
-    all_clusters = session.query(ClusterModel).all()
-    for c in all_clusters:
-        cluster_type_map[c.id] = c.cluster_type
+    if relevant_cluster_ids:
+        clusters = session.query(ClusterModel).filter(
+            ClusterModel.id.in_(relevant_cluster_ids)
+        ).all()
+        for c in clusters:
+            cluster_type_map[c.id] = c.cluster_type
 
-    # Pre-load cluster -> domain mappings
+    # Pre-load cluster -> domain mappings for relevant clusters only
     cluster_domain_map: dict[str, set[str]] = {}
-    all_members = session.query(ClusterMemberModel).all()
-    for m in all_members:
-        cluster_domain_map.setdefault(m.cluster_id, set()).add(m.domain_id)
+    if relevant_cluster_ids:
+        members = session.query(ClusterMemberModel).filter(
+            ClusterMemberModel.cluster_id.in_(relevant_cluster_ids)
+        ).all()
+        for m in members:
+            cluster_domain_map.setdefault(m.cluster_id, set()).add(m.domain_id)
 
     # C-2 fix: Collect relevant domain IDs from clusters linked to active campaigns
     relevant_domain_ids: set[str] = set()
