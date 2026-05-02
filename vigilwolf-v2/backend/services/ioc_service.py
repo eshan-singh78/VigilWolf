@@ -15,6 +15,11 @@ from sqlalchemy.orm import Session
 
 logger = logging.getLogger(__name__)
 
+
+def _escape_like(q: str) -> str:
+    """Escape SQL LIKE wildcards (% and _) in user input."""
+    return q.replace("%", "\\%").replace("_", "\\_")
+
 # ---------------------------------------------------------------------------
 # Type mapping: findings key -> IocModel.type value
 # ---------------------------------------------------------------------------
@@ -513,7 +518,7 @@ def search_iocs(
         IocOccurrenceModel, IocModel.id == IocOccurrenceModel.ioc_id
     )
 
-    q = q.filter(IocModel.value.ilike(f"%{query}%"))
+    q = q.filter(IocModel.value.ilike(f"%{_escape_like(query)}%", escape="\\"))
 
     if ioc_type:
         q = q.filter(IocModel.type == ioc_type)

@@ -18,6 +18,11 @@ from database import (
     get_db,
 )
 
+
+def _escape_like(q: str) -> str:
+    """Escape SQL LIKE wildcards (% and _) in user input."""
+    return q.replace("%", "\\%").replace("_", "\\_")
+
 router = APIRouter()
 
 
@@ -133,7 +138,7 @@ def list_iocs(
     if type:
         query = query.where(IocModel.type == type)
     if q:
-        query = query.where(IocModel.value.ilike(f"%{q}%"))
+        query = query.where(IocModel.value.ilike(f"%{_escape_like(q)}%", escape="\\"))
 
     # Total count
     count_query = select(func.count()).select_from(query.subquery())

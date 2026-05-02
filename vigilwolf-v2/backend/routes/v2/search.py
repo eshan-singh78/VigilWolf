@@ -18,6 +18,11 @@ from database import (
     get_db,
 )
 
+
+def _escape_like(q: str) -> str:
+    """Escape SQL LIKE wildcards (% and _) in user input."""
+    return q.replace("%", "\\%").replace("_", "\\_")
+
 router = APIRouter()
 
 
@@ -81,7 +86,7 @@ def global_search(
 ) -> SearchResponse:
     """Global search: search domains by name, risk_level, brand."""
     # Search by domain URL
-    domain_query = select(DomainModel).where(DomainModel.url.ilike(f"%{q}%"))
+    domain_query = select(DomainModel).where(DomainModel.url.ilike(f"%{_escape_like(q)}%", escape="\\"))
     domains = session.execute(domain_query.limit(limit)).scalars().all()
 
     results: list[SearchResult] = []

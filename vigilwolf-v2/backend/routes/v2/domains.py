@@ -6,8 +6,8 @@ from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, ConfigDict
-from sqlalchemy import select, func
-from sqlalchemy.orm import Session
+from sqlalchemy import select, func, and_, exists
+from sqlalchemy.orm import Session, aliased
 
 from database import (
     DomainModel,
@@ -17,6 +17,11 @@ from database import (
     SnapshotPluginStatusModel,
     get_db,
 )
+
+
+def _escape_like(q: str) -> str:
+    """Escape SQL LIKE wildcards (% and _) in user input."""
+    return q.replace("%", "\\%").replace("_", "\\_")
 
 router = APIRouter()
 
@@ -98,6 +103,20 @@ class DomainsListResponse(BaseModel):
     total: int
 
 
+def _risk_brief(rs: RiskScoreModel | None) -> Optional[RiskScoreBrief]:
+    if not rs:
+        return None
+    return RiskScoreBrief(
+        total_score=rs.total_score,
+        normalized_score=rs.normalized_score,
+        risk_level=rs.risk_level,
+        severity=rs.severity,
+        reasons=rs.reasons if isinstance(rs.reasons, list) else [],
+        dominant_signals=rs.dominant_signals if isinstance(rs.dominant_signals, list) else [],
+        overall_confidence=rs.overall_confidence,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Endpoints
 # ---------------------------------------------------------------------------
@@ -112,92 +131,66 @@ def list_domains(
     session: Session = Depends(get_db),
 ) -> DomainsListResponse:
     """List domains with cursor-based pagination and filters."""
-    query = select(DomainModel)
+    latest_ts_subq = (
+        select(
+            SnapshotModel.domain_id.label("domain_id"),
+            func.max(SnapshotModel.timestamp).label("latest_ts"),
+        )
+        .group_by(SnapshotModel.domain_id)
+        .subquery()
+    )
+    latest_snapshot = aliased(SnapshotModel)
 
-    # Search filter
+    query = (
+        select(DomainModel, RiskScoreModel)
+        .outerjoin(latest_ts_subq, latest_ts_subq.c.domain_id == DomainModel.id)
+        .outerjoin(
+            latest_snapshot,
+            and_(
+                latest_snapshot.domain_id == DomainModel.id,
+                latest_snapshot.timestamp == latest_ts_subq.c.latest_ts,
+            ),
+        )
+        .outerjoin(RiskScoreModel, RiskScoreModel.snapshot_id == latest_snapshot.id)
+    )
+
     if q:
-        query = query.where(DomainModel.url.ilike(f"%{q}%"))
-
-    # Cursor pagination
+        query = query.where(DomainModel.url.ilike(f"%{_escape_like(q)}%", escape="\\"))
     if cursor:
         query = query.where(DomainModel.id > cursor)
+    if risk_level:
+        query = query.where(RiskScoreModel.risk_level == risk_level)
+    if brand:
+        brand_exists = exists(
+            select(1).where(
+                AnalysisResultModel.snapshot_id == latest_snapshot.id,
+                AnalysisResultModel.tags.contains([brand]),
+            )
+        )
+        query = query.where(brand_exists)
 
-    # Apply ordering
-    query = query.order_by(DomainModel.id)
+    count_query = select(func.count()).select_from(query.subquery())
+    total = session.execute(count_query).scalar() or 0
+    rows = session.execute(query.order_by(DomainModel.id).limit(limit + 1)).all()
+    page_rows = rows[:limit]
 
-    # For risk_level and brand filters we need to join with snapshots and
-    # risk scores / analysis results. Since DISTINCT ON is PostgreSQL-only,
-    # we use a simple join approach — this may return duplicates if a domain
-    # has multiple matching snapshots, but we deduplicate in Python.
-    if risk_level or brand:
-        query = query.join(SnapshotModel, SnapshotModel.domain_id == DomainModel.id)
-
-        if risk_level:
-            query = query.join(RiskScoreModel, RiskScoreModel.snapshot_id == SnapshotModel.id)
-            query = query.where(RiskScoreModel.risk_level == risk_level)
-
-        if brand:
-            query = query.join(AnalysisResultModel, AnalysisResultModel.snapshot_id == SnapshotModel.id)
-            query = query.where(AnalysisResultModel.tags.contains([brand]))
-
-    all_domains = session.execute(query).scalars().all()
-
-    # Deduplicate by domain id (joins may produce duplicates)
-    seen_ids: set[str] = set()
-    unique_domains: list[DomainModel] = []
-    for domain in all_domains:
-        if domain.id not in seen_ids:
-            seen_ids.add(domain.id)
-            unique_domains.append(domain)
-
-    total = len(unique_domains)
-    page = unique_domains[:limit]
-
-    # Build response items
     items: list[DomainListItem] = []
-    for domain in page:
-        item = DomainListItem(
-            id=domain.id,
-            group_id=domain.group_id,
-            url=domain.url,
-            active=domain.active,
-        )
-        # Try to attach risk score from latest snapshot
-        latest_snapshot = (
-            session.execute(
-                select(SnapshotModel)
-                .where(SnapshotModel.domain_id == domain.id)
-                .order_by(SnapshotModel.timestamp.desc())
-                .limit(1)
+    for domain, rs in page_rows:
+        items.append(
+            DomainListItem(
+                id=domain.id,
+                group_id=domain.group_id,
+                url=domain.url,
+                active=domain.active,
+                risk_level=rs.risk_level if rs else None,
+                risk_score=_risk_brief(rs),
             )
-            .scalars()
-            .first()
         )
-        if latest_snapshot:
-            rs = (
-                session.execute(
-                    select(RiskScoreModel).where(RiskScoreModel.snapshot_id == latest_snapshot.id)
-                )
-                .scalars()
-                .first()
-            )
-            if rs:
-                item.risk_level = rs.risk_level
-                item.risk_score = RiskScoreBrief(
-                    total_score=rs.total_score,
-                    normalized_score=rs.normalized_score,
-                    risk_level=rs.risk_level,
-                    severity=rs.severity,
-                    reasons=rs.reasons if isinstance(rs.reasons, list) else [],
-                    dominant_signals=rs.dominant_signals if isinstance(rs.dominant_signals, list) else [],
-                    overall_confidence=rs.overall_confidence,
-                )
-        items.append(item)
 
     # Next cursor
     next_cursor = None
-    if total > limit:
-        next_cursor = page[-1].id
+    if len(rows) > limit:
+        next_cursor = page_rows[-1][0].id
 
     return DomainsListResponse(items=items, next_cursor=next_cursor, total=total)
 
@@ -353,67 +346,53 @@ def list_threats(
     session: Session = Depends(get_db),
 ) -> DomainsListResponse:
     """Threat feed: domains with risk_level high or medium."""
-    # Join domains with snapshots + risk scores. Since DISTINCT ON is
-    # PostgreSQL-only, we do a simple join and deduplicate in Python.
-    query = (
-        select(DomainModel)
-        .join(SnapshotModel, SnapshotModel.domain_id == DomainModel.id)
-        .join(RiskScoreModel, RiskScoreModel.snapshot_id == SnapshotModel.id)
-        .where(RiskScoreModel.risk_level.in_(["high", "medium"]))
-        .order_by(DomainModel.id, SnapshotModel.timestamp.desc())
+    latest_ts_subq = (
+        select(
+            SnapshotModel.domain_id.label("domain_id"),
+            func.max(SnapshotModel.timestamp).label("latest_ts"),
+        )
+        .group_by(SnapshotModel.domain_id)
+        .subquery()
     )
+    latest_snapshot = aliased(SnapshotModel)
 
+    query = (
+        select(DomainModel, RiskScoreModel)
+        .join(latest_ts_subq, latest_ts_subq.c.domain_id == DomainModel.id)
+        .join(
+            latest_snapshot,
+            and_(
+                latest_snapshot.domain_id == DomainModel.id,
+                latest_snapshot.timestamp == latest_ts_subq.c.latest_ts,
+            ),
+        )
+        .join(RiskScoreModel, RiskScoreModel.snapshot_id == latest_snapshot.id)
+        .where(RiskScoreModel.risk_level.in_(["high", "medium"]))
+    )
     if cursor:
         query = query.where(DomainModel.id > cursor)
 
-    all_results = session.execute(query).scalars().all()
-
-    # Deduplicate by domain id (joins may produce duplicates)
-    seen_ids: set[str] = set()
-    unique_domains: list[DomainModel] = []
-    for domain in all_results:
-        if domain.id not in seen_ids:
-            seen_ids.add(domain.id)
-            unique_domains.append(domain)
-
-    total = len(unique_domains)
-    page = unique_domains[:limit]
+    count_query = select(func.count()).select_from(query.subquery())
+    total = session.execute(count_query).scalar() or 0
+    rows = session.execute(query.order_by(DomainModel.id).limit(limit + 1)).all()
+    page_rows = rows[:limit]
 
     items: list[DomainListItem] = []
-    for domain in page:
-        rs = (
-            session.execute(
-                select(RiskScoreModel)
-                .join(SnapshotModel, RiskScoreModel.snapshot_id == SnapshotModel.id)
-                .where(SnapshotModel.domain_id == domain.id)
-                .order_by(SnapshotModel.timestamp.desc())
-                .limit(1)
-            )
-            .scalars()
-            .first()
-        )
-        item = DomainListItem(
-            id=domain.id,
-            group_id=domain.group_id,
-            url=domain.url,
-            active=domain.active,
-            risk_level=rs.risk_level if rs else None,
-        )
-        if rs:
-            item.risk_score = RiskScoreBrief(
-                total_score=rs.total_score,
-                normalized_score=rs.normalized_score,
+    for domain, rs in page_rows:
+        items.append(
+            DomainListItem(
+                id=domain.id,
+                group_id=domain.group_id,
+                url=domain.url,
+                active=domain.active,
                 risk_level=rs.risk_level,
-                severity=rs.severity,
-                reasons=rs.reasons if isinstance(rs.reasons, list) else [],
-                dominant_signals=rs.dominant_signals if isinstance(rs.dominant_signals, list) else [],
-                overall_confidence=rs.overall_confidence,
+                risk_score=_risk_brief(rs),
             )
-        items.append(item)
+        )
 
     next_cursor = None
-    if total > limit:
-        next_cursor = page[-1].id
+    if len(rows) > limit:
+        next_cursor = page_rows[-1][0].id
 
     return DomainsListResponse(items=items, next_cursor=next_cursor, total=total)
 
