@@ -1,7 +1,7 @@
 """Thread-safe pipeline metrics tracker for VigilWolf v2."""
 import threading
 import time
-from collections import defaultdict
+from collections import defaultdict, deque
 from dataclasses import dataclass, field
 
 
@@ -18,7 +18,7 @@ class PipelineMetrics:
     alerts_failed: int = 0
     start_time: float = field(default_factory=time.time)
     queue_depth: int = 0
-    _processing_times: list = field(default_factory=list)
+    _processing_times: deque = field(default_factory=lambda: deque(maxlen=10000))
 
     def record_domain_processed(self) -> None:
         with self._lock:

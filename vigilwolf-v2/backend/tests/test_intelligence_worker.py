@@ -102,6 +102,7 @@ def test_run_pipeline_skips_disabled_stages(mock_config, mock_emit):
     mock_config.CLUSTERING_ENABLED = False
     mock_config.CAMPAIGN_DETECTION_ENABLED = False
     mock_config.PHISHKIT_DETECTION_ENABLED = False
+    mock_config.C2_DETECTION_ENABLED = False
     mock_config.ACTOR_PROFILING_ENABLED = False
 
     from intelligence_worker import run_intelligence_pipeline

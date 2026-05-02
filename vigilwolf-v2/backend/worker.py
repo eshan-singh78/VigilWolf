@@ -62,12 +62,12 @@ def _get_actors():
 
     broker = _get_broker()
 
-    @dramatiq.actor(broker=broker)
+    @dramatiq.actor(broker=broker, max_retries=3, max_age=3600000, time_limit=300000)
     def capture_domain_actor(domain_id: str, url: str, trigger_type: str = "nrd_ingest"):
         result = capture_domain(domain_id=domain_id, url=url, trigger_type=trigger_type)
         return result
 
-    @dramatiq.actor(broker=broker)
+    @dramatiq.actor(broker=broker, max_retries=3, max_age=3600000, time_limit=300000)
     def build_context_and_analyze_actor(snapshot_id: str, domain_id: str, url: str, html: str, snapshot_record: dict):
         build_context_and_analyze(
             snapshot_id=snapshot_id, domain_id=domain_id, url=url,
@@ -527,9 +527,16 @@ def orchestrate_analysis(ctx: SnapshotContext) -> None:
                     _emit_processing_update(ctx.snapshot_id, ctx.domain, plugin_name, "failed")
 
         # Aggregate results and score
-        aggregate_results(ctx, all_results)
+        scoring_failed = False
+        try:
+            aggregate_results(ctx, all_results)
+        except Exception:
+            scoring_failed = True
+            logger.exception("Scoring failed for snapshot_id=%s; continuing with IOC persist + intelligence pipeline", ctx.snapshot_id)
 
         # Persist IOC extraction results if ioc_extractor ran successfully
+        # This runs regardless of scoring success — IOC data is needed by
+        # downstream intelligence services (clustering, campaigns).
         ioc_results = [r for r in all_results if r.plugin_name == "ioc_extractor" and not r.error]
         if ioc_results:
             try:
@@ -541,6 +548,7 @@ def orchestrate_analysis(ctx: SnapshotContext) -> None:
                             findings=ioc_result.findings,
                             session=ioc_session,
                         )
+                    ioc_session.commit()
                     logger.info("Persisted IOC results for snapshot_id=%s", ctx.snapshot_id)
             except Exception:
                 logger.exception("Failed to persist IOCs for snapshot_id=%s", ctx.snapshot_id)
@@ -549,6 +557,8 @@ def orchestrate_analysis(ctx: SnapshotContext) -> None:
         _inc_domains_processed()
 
         # Enqueue intelligence pipeline (clustering, campaigns, phishkits, actors)
+        # Runs even if scoring failed — intelligence pipeline uses plugin results,
+        # not the risk score.
         if config.INTELLIGENCE_PIPELINE_ENABLED:
             try:
                 from intelligence_worker import enqueue_intelligence_pipeline
@@ -556,8 +566,11 @@ def orchestrate_analysis(ctx: SnapshotContext) -> None:
             except Exception:
                 logger.exception("Failed to enqueue intelligence pipeline for snapshot_id=%s", ctx.snapshot_id)
 
-        # Record pipeline success metric
-        pipeline_metrics.record_success(_time.time() - _start)
+        # Record pipeline success/failure metric
+        if scoring_failed:
+            pipeline_metrics.record_failure()
+        else:
+            pipeline_metrics.record_success(_time.time() - _start)
 
     except Exception:
         pipeline_metrics.record_failure()

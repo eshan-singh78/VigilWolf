@@ -10,10 +10,12 @@ import hashlib
 import logging
 import uuid
 from collections import defaultdict
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Optional
 
 logger = logging.getLogger(__name__)
+
+CLUSTERING_WINDOW_DAYS = 30
 
 
 # ---------------------------------------------------------------------------
@@ -40,10 +42,22 @@ def cluster_by_structural_hash(session) -> dict:
         SnapshotModel,
     )
 
-    # Collect all html_hasher analysis results.
+    # Only consider recent snapshots to avoid re-scanning the entire history.
+    clustering_cutoff = datetime.now(timezone.utc) - timedelta(days=CLUSTERING_WINDOW_DAYS)
+
+    recent_snapshot_ids = {
+        row.id
+        for row in session.query(SnapshotModel)
+        .filter(SnapshotModel.timestamp >= clustering_cutoff)
+        .all()
+    }
+
     results = (
         session.query(AnalysisResultModel)
-        .filter(AnalysisResultModel.plugin_name == "html_hasher")
+        .filter(
+            AnalysisResultModel.plugin_name == "html_hasher",
+            AnalysisResultModel.snapshot_id.in_(recent_snapshot_ids),
+        )
         .all()
     )
 
@@ -69,7 +83,7 @@ def cluster_by_structural_hash(session) -> dict:
     domains_clustered = 0
 
     for structural_hash, domain_ids in hash_groups.items():
-        if len(domain_ids) < 2:
+        if len(domain_ids) < 3:
             continue
 
         # Find or create the cluster.
@@ -84,43 +98,66 @@ def cluster_by_structural_hash(session) -> dict:
         )
 
         if cluster is None:
-            cluster = ClusterModel(
-                id=str(uuid.uuid4()),
-                cluster_type="html_similarity",
-                signature_hash=structural_hash,
-                signature_type="structural_hash",
-                description=f"HTML structural similarity cluster ({structural_hash[:12]}...)",
-                domain_count=0,
-            )
-            session.add(cluster)
-            session.flush()  # ensure cluster.id is available
-            clusters_created += 1
+            try:
+                with session.begin_nested():
+                    cluster = ClusterModel(
+                        id=str(uuid.uuid4()),
+                        cluster_type="html_similarity",
+                        signature_hash=structural_hash,
+                        signature_type="structural_hash",
+                        description=f"HTML structural similarity cluster ({structural_hash[:12]}...)",
+                        domain_count=0,
+                    )
+                    session.add(cluster)
+                    session.flush()
+                clusters_created += 1
+            except Exception:
+                # Concurrent insert — look up the cluster that was just created
+                cluster = (
+                    session.query(ClusterModel)
+                    .filter(
+                        ClusterModel.cluster_type == "html_similarity",
+                        ClusterModel.signature_hash == structural_hash,
+                        ClusterModel.signature_type == "structural_hash",
+                    )
+                    .first()
+                )
+                if cluster is None:
+                    logger.error("Cluster lookup failed after IntegrityError for hash %s", structural_hash[:12])
+                    continue
 
         # Add member domains (skip if already a member).
         added = 0
         for domain_id in domain_ids:
-            exists = (
-                session.query(ClusterMemberModel)
-                .filter(
-                    ClusterMemberModel.cluster_id == cluster.id,
-                    ClusterMemberModel.domain_id == domain_id,
+            try:
+                with session.begin_nested():
+                    exists = (
+                        session.query(ClusterMemberModel)
+                        .filter(
+                            ClusterMemberModel.cluster_id == cluster.id,
+                            ClusterMemberModel.domain_id == domain_id,
+                        )
+                        .first()
+                    )
+                    if exists:
+                        continue
+                    member = ClusterMemberModel(
+                        cluster_id=cluster.id,
+                        domain_id=domain_id,
+                        confidence=1.0,  # exact structural match
+                    )
+                    session.add(member)
+                    session.flush()
+                added += 1
+            except Exception:
+                logger.debug(
+                    "Cluster member already exists: cluster=%s domain=%s",
+                    cluster.id[:8], domain_id[:8],
                 )
-                .first()
-            )
-            if exists:
-                continue
-
-            member = ClusterMemberModel(
-                cluster_id=cluster.id,
-                domain_id=domain_id,
-                confidence=1.0,  # exact structural match
-            )
-            session.add(member)
-            added += 1
 
         # Update cluster metadata.
         if added:
-            cluster.domain_count = len(domain_ids)
+            cluster.domain_count += added
             cluster.last_seen = datetime.now(timezone.utc)
             domains_clustered += added
             logger.debug(
@@ -183,9 +220,26 @@ def _build_infra_signature(domain_id: str, session) -> Optional[str]:
     )
     first_ns = ns_record.value if ns_record else None
 
-    # Build signature.  We need ASN to produce a meaningful infra signature.
-    if asn is None and registrar is None and first_ns is None:
+    # Build signature. Require at least 2 of 3 signal fields to avoid grouping
+    # unrelated domains that happen to share a blank field.
+    signal_count = sum(1 for v in (asn, registrar, first_ns) if v is not None)
+    if signal_count < 2:
         return None
+
+    # Penalize common registrars that create false clusters — domains sharing
+    # only a popular registrar are unlikely to be related.
+    _COMMON_REGISTRARS = {
+        "namecheap", "godaddy", "register.com", "enom", "tucows",
+        "network solutions", "123-reg", "key-systems", "pdr ltd.",
+    }
+    if registrar and registrar.lower().strip() in _COMMON_REGISTRARS and signal_count < 3:
+        # A common registrar alone (without ASN and NS also matching) is
+        # insufficient to link domains — downgrade to None so it doesn't
+        # contribute to the signature hash.
+        registrar = None
+        signal_count -= 1
+        if signal_count < 2:
+            return None
 
     return f"{asn or '_'}|{registrar or '_'}|{first_ns or '_'}"
 
@@ -206,10 +260,20 @@ def cluster_by_infrastructure(session) -> dict:
         ClusterMemberModel,
         ClusterModel,
         DomainModel,
+        SnapshotModel,
     )
 
-    # Build signatures for every domain.
-    domains = session.query(DomainModel).all()
+    # Only consider domains that have been seen recently.
+    clustering_cutoff = datetime.now(timezone.utc) - timedelta(days=CLUSTERING_WINDOW_DAYS)
+
+    recent_domain_ids = {
+        row.domain_id
+        for row in session.query(SnapshotModel)
+        .filter(SnapshotModel.timestamp >= clustering_cutoff)
+        .all()
+    }
+
+    domains = session.query(DomainModel).filter(DomainModel.id.in_(recent_domain_ids)).all()
     sig_groups: dict[str, list[str]] = defaultdict(list)
 
     for domain in domains:
@@ -222,7 +286,7 @@ def cluster_by_infrastructure(session) -> dict:
     domains_clustered = 0
 
     for sig, domain_ids in sig_groups.items():
-        if len(domain_ids) < 2:
+        if len(domain_ids) < 3:
             continue
 
         # Derive a stable hash from the signature string.
@@ -240,43 +304,66 @@ def cluster_by_infrastructure(session) -> dict:
         )
 
         if cluster is None:
-            cluster = ClusterModel(
-                id=str(uuid.uuid4()),
-                cluster_type="infra",
-                signature_hash=sig_hash,
-                signature_type="infra_signature",
-                description=f"Infrastructure cluster (ASN/registrar/NS: {sig})",
-                domain_count=0,
-                meta={"raw_signature": sig},
-            )
-            session.add(cluster)
-            session.flush()
-            clusters_created += 1
+            try:
+                with session.begin_nested():
+                    cluster = ClusterModel(
+                        id=str(uuid.uuid4()),
+                        cluster_type="infra",
+                        signature_hash=sig_hash,
+                        signature_type="infra_signature",
+                        description=f"Infrastructure cluster (ASN/registrar/NS: {sig})",
+                        domain_count=0,
+                        meta={"raw_signature": sig},
+                    )
+                    session.add(cluster)
+                    session.flush()
+                clusters_created += 1
+            except Exception:
+                # Concurrent insert — look up the cluster that was just created
+                cluster = (
+                    session.query(ClusterModel)
+                    .filter(
+                        ClusterModel.cluster_type == "infra",
+                        ClusterModel.signature_hash == sig_hash,
+                        ClusterModel.signature_type == "infra_signature",
+                    )
+                    .first()
+                )
+                if cluster is None:
+                    logger.error("Cluster lookup failed after IntegrityError for infra hash %s", sig_hash[:12])
+                    continue
 
         # Add member domains.
         added = 0
         for domain_id in domain_ids:
-            exists = (
-                session.query(ClusterMemberModel)
-                .filter(
-                    ClusterMemberModel.cluster_id == cluster.id,
-                    ClusterMemberModel.domain_id == domain_id,
+            try:
+                with session.begin_nested():
+                    exists = (
+                        session.query(ClusterMemberModel)
+                        .filter(
+                            ClusterMemberModel.cluster_id == cluster.id,
+                            ClusterMemberModel.domain_id == domain_id,
+                        )
+                        .first()
+                    )
+                    if exists:
+                        continue
+                    member = ClusterMemberModel(
+                        cluster_id=cluster.id,
+                        domain_id=domain_id,
+                        confidence=0.8,  # infra match is softer than structural hash
+                    )
+                    session.add(member)
+                    session.flush()
+                added += 1
+            except Exception:
+                logger.debug(
+                    "Cluster member already exists: cluster=%s domain=%s",
+                    cluster.id[:8], domain_id[:8],
                 )
-                .first()
-            )
-            if exists:
-                continue
-
-            member = ClusterMemberModel(
-                cluster_id=cluster.id,
-                domain_id=domain_id,
-                confidence=0.8,  # infra match is softer than structural hash
-            )
-            session.add(member)
-            added += 1
 
         if added:
-            cluster.domain_count = len(domain_ids)
+            cluster.domain_count += added
             cluster.last_seen = datetime.now(timezone.utc)
             domains_clustered += added
             logger.debug(

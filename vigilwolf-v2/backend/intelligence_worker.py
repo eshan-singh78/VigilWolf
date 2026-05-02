@@ -1,7 +1,7 @@
 """VigilWolf v2 — Intelligence Pipeline Worker.
 
 Orchestrates the Phase 2/3 intelligence pipeline after domain scoring completes:
-  clustering -> campaign detection -> phishkit detection -> actor profiling
+  clustering -> campaign detection -> phishkit detection -> C2 detection -> actor profiling
 
 Each step is gated by its feature flag and runs independently — a failure in one
 step does not prevent subsequent steps from executing.  When
@@ -37,7 +37,7 @@ def _get_intelligence_actor():
 
     broker = _get_broker()
 
-    @dramatiq.actor(broker=broker)
+    @dramatiq.actor(broker=broker, max_retries=3, max_age=3600000, time_limit=300000)
     def run_intelligence_pipeline_actor(snapshot_id: str) -> None:
         run_intelligence_pipeline(snapshot_id)
 
@@ -53,11 +53,12 @@ def _get_intelligence_actor():
 def run_intelligence_pipeline(snapshot_id: str) -> Optional[dict]:
     """Execute the intelligence pipeline for a single snapshot.
 
-    Chains four stages, each gated by its feature flag:
+    Chains five stages, each gated by its feature flag:
       1. Clustering          (CLUSTERING_ENABLED)
       2. Campaign detection  (CAMPAIGN_DETECTION_ENABLED)
       3. PhishKit detection  (PHISHKIT_DETECTION_ENABLED)
-      4. Actor profiling     (ACTOR_PROFILING_ENABLED)
+      4. C2 detection        (C2_DETECTION_ENABLED)
+      5. Actor profiling     (ACTOR_PROFILING_ENABLED)
 
     Each stage catches its own exceptions and logs them without aborting the
     remaining stages.  On completion (whether all stages ran or not), an
@@ -82,6 +83,21 @@ def run_intelligence_pipeline(snapshot_id: str) -> Optional[dict]:
         "snapshot_id": snapshot_id,
         "stages": {},
     }
+
+    # Reconcile orphaned plugin statuses from crashed pipelines
+    try:
+        from database import get_session  # type: ignore[import-untyped]
+        from services.reconciliation_service import reconcile_orphaned_statuses  # type: ignore[import-untyped]
+
+        with get_session() as recon_session:
+            recon_result = reconcile_orphaned_statuses(recon_session)
+            recon_session.commit()
+        if recon_result.get("reconciled_running", 0) > 0 or recon_result.get("reconciled_pending", 0) > 0:
+            logger.info(
+                "Reconciled orphaned statuses: %s", recon_result,
+            )
+    except Exception:
+        logger.exception("Failed to reconcile orphaned plugin statuses")
 
     logger.info("Starting intelligence pipeline for snapshot_id=%s", snapshot_id)
 
@@ -151,7 +167,50 @@ def run_intelligence_pipeline(snapshot_id: str) -> Optional[dict]:
             "PhishKit detection disabled; skipping for snapshot_id=%s", snapshot_id,
         )
 
-    # --- Stage 4: Actor profiling ---
+    # --- Stage 4: C2 detection ---
+    if config.C2_DETECTION_ENABLED:
+        try:
+            from database import get_session, C2CandidateModel  # type: ignore[import-untyped]
+            from services.c2_service import rank_c2_candidates  # type: ignore[import-untyped]
+
+            with get_session() as session:
+                c2_result = rank_c2_candidates(session)
+                if c2_result:
+                    # Persist top C2 candidates
+                    for candidate in c2_result:
+                        try:
+                            with session.begin_nested():
+                                c2_row = C2CandidateModel(
+                                    ioc_id=candidate["ioc_id"],
+                                    snapshot_id=snapshot_id,
+                                    c2_score=candidate["c2_score"],
+                                    signals=candidate.get("signals", []),
+                                )
+                                session.add(c2_row)
+                                session.flush()
+                        except Exception:
+                            logger.debug("C2 candidate already exists for ioc_id=%d", candidate["ioc_id"])
+                    session.commit()
+            results["stages"]["c2_detection"] = {
+                "candidates_found": len(c2_result) if c2_result else 0,
+            }
+
+            logger.info(
+                "C2 detection complete for snapshot_id=%s: %d candidates",
+                snapshot_id, len(c2_result) if c2_result else 0,
+            )
+        except Exception:
+            logger.exception(
+                "C2 detection failed for snapshot_id=%s; continuing.",
+                snapshot_id,
+            )
+            results["stages"]["c2_detection"] = {"error": True}
+    else:
+        logger.debug(
+            "C2 detection disabled; skipping for snapshot_id=%s", snapshot_id,
+        )
+
+    # --- Stage 5: Actor profiling ---
     if config.ACTOR_PROFILING_ENABLED:
         try:
             from database import get_session  # type: ignore[import-untyped]
