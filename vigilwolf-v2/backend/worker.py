@@ -257,12 +257,15 @@ def capture_domain(domain_id: str, url: str, trigger_type: str = "nrd_ingest") -
     Returns the snapshot_id on success, None on failure.
     """
     try:
-        from plugins.capture_engine import capture_html  # type: ignore[import-untyped]
-    except ImportError:
+        from plugins.capture_engine import capture_html, validate_capture_url  # type: ignore[import-untyped]
+    except ImportError as exc:
+        if config.ENVIRONMENT == "production":
+            raise RuntimeError("capture_engine module missing in production") from exc
         logger.error("capture_engine module not available; cannot capture domain.")
         return None
 
     try:
+        validate_capture_url(url)
         # Step 1 — Capture HTML
         capture_result = capture_html(url)
         if not capture_result or not capture_result.get("html"):
@@ -306,9 +309,14 @@ def capture_domain(domain_id: str, url: str, trigger_type: str = "nrd_ingest") -
                 html=html,
             )
             html_path = save_result.get("html_path", "") if save_result else ""
-        except ImportError:
+        except ImportError as exc:
+            if config.ENVIRONMENT == "production":
+                raise RuntimeError("storage_manager module missing in production") from exc
             logger.warning("storage_manager not available; saving html_path as empty string.")
             html_path = ""
+
+        if config.ENVIRONMENT == "production" and not html_path:
+            raise RuntimeError("storage_manager returned empty html_path in production")
 
         with _get_session() as session:
             snapshot = SnapshotModel(
@@ -619,17 +627,11 @@ def dispatch_alert(ctx: SnapshotContext, score_outcome: dict) -> None:
         return
 
     try:
+        from database import get_session  # type: ignore[import-untyped]
         from services.alert_service import AlertService  # type: ignore[import-untyped]
         alert_service = AlertService()
-        alert_service.send_alert(
-            snapshot_id=ctx.snapshot_id,
-            domain=ctx.domain,
-            risk_level=score_outcome["risk_level"],
-            severity=score_outcome["severity"],
-            score=score_outcome["score"],
-            reasons=score_outcome.get("reasons", []),
-            dominant_signals=score_outcome.get("dominant_signals", []),
-        )
+        with get_session() as session:
+            alert_service.send_alert(ctx, score_outcome, session)
 
         # Publish alert_dispatched event for SSE streaming
         try:

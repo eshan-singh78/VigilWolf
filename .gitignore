@@ -3,6 +3,6 @@
 .hypothesis/
 __pycache__/
 .pytest_cache/
-test*.py
+/test*.py
 data/
 imp.txt
