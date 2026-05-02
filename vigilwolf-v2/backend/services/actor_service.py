@@ -27,7 +27,7 @@ WEIGHT_SHARED_INFRA = 0.3
 WEIGHT_SHARED_IOCS = 0.2
 WEIGHT_TEMPORAL = 0.2
 
-MAX_CAMPAIGNS_PER_PROFILE = 500
+MAX_CAMPAIGNS_PER_PROFILE = 100
 
 # Confidence thresholds
 CONFIDENCE_THRESHOLD = 0.6
@@ -109,228 +109,6 @@ def _compute_shared_kit(camp_a, camp_b, session) -> float:
         return 0.0
     return 1.0 if sig_a == sig_b else 0.0
 
-
-def _compute_shared_infra(camp_a, camp_b, session) -> float:
-    """Compute shared infrastructure similarity between two campaigns.
-
-    Compares the sets of infra-cluster IDs associated with each campaign
-    via CampaignClusterModel and uses Jaccard similarity.
-    """
-    from database import CampaignClusterModel  # type: ignore[import-untyped]
-
-    clusters_a = {
-        row.cluster_id
-        for row in session.query(CampaignClusterModel)
-        .filter(CampaignClusterModel.campaign_id == camp_a.id)
-        .all()
-    }
-    clusters_b = {
-        row.cluster_id
-        for row in session.query(CampaignClusterModel)
-        .filter(CampaignClusterModel.campaign_id == camp_b.id)
-        .all()
-    }
-
-    # Filter to infra clusters only
-    from database import ClusterModel  # type: ignore[import-untyped]
-
-    if clusters_a:
-        infra_a = {
-            cid
-            for cid in clusters_a
-            if session.query(ClusterModel).get(cid) is not None
-            and session.query(ClusterModel).get(cid).cluster_type == "infra"
-        }
-    else:
-        infra_a = set()
-
-    if clusters_b:
-        infra_b = {
-            cid
-            for cid in clusters_b
-            if session.query(ClusterModel).get(cid) is not None
-            and session.query(ClusterModel).get(cid).cluster_type == "infra"
-        }
-    else:
-        infra_b = set()
-
-    return _jaccard(infra_a, infra_b)
-
-
-def _compute_shared_iocs(camp_a, camp_b, session) -> float:
-    """Compute shared IOC similarity between two campaigns.
-
-    Gathers IOC IDs from all domains belonging to each campaign and computes
-    Jaccard similarity.
-    """
-    from database import (  # type: ignore[import-untyped]
-        ClusterMemberModel,
-        CampaignClusterModel,
-        DomainModel,
-        IocOccurrenceModel,
-        SnapshotModel,
-    )
-
-    def _campaign_ioc_ids(campaign_id: str) -> set[int]:
-        """Resolve all IOC IDs for a campaign through its clusters and domains."""
-        cluster_ids = {
-            row.cluster_id
-            for row in session.query(CampaignClusterModel)
-            .filter(CampaignClusterModel.campaign_id == campaign_id)
-            .all()
-        }
-        if not cluster_ids:
-            return set()
-
-        domain_ids = {
-            row.domain_id
-            for row in session.query(ClusterMemberModel)
-            .filter(ClusterMemberModel.cluster_id.in_(cluster_ids))
-            .all()
-        }
-        if not domain_ids:
-            return set()
-
-        snapshot_ids = {
-            row.id
-            for row in session.query(SnapshotModel)
-            .filter(SnapshotModel.domain_id.in_(domain_ids))
-            .all()
-        }
-        if not snapshot_ids:
-            return set()
-
-        return {
-            row.ioc_id
-            for row in session.query(IocOccurrenceModel)
-            .filter(IocOccurrenceModel.snapshot_id.in_(snapshot_ids))
-            .all()
-        }
-
-    iocs_a = _campaign_ioc_ids(camp_a.id)
-    iocs_b = _campaign_ioc_ids(camp_b.id)
-    return _jaccard(iocs_a, iocs_b)
-
-
-def _build_fingerprint(
-    camp_a,
-    camp_b,
-    shared_kit: float,
-    shared_infra: float,
-    shared_iocs: float,
-    temporal: float,
-    session,
-) -> dict:
-    """Build the actor fingerprint JSON blob.
-
-    Aggregates shared signals and derives preferred registrar, ASN, exfil
-    channels, and target brands from the linked campaigns and their clusters.
-    """
-    from database import (  # type: ignore[import-untyped]
-        CampaignClusterModel,
-        ClusterMemberModel,
-        ClusterModel,
-        DomainIpModel,
-        DnsRecordModel,
-        DomainModel,
-        IocModel,
-        IocOccurrenceModel,
-        SnapshotModel,
-    )
-
-    fingerprint: dict = {
-        "shared_signals": {
-            "shared_kit": round(shared_kit, 4),
-            "shared_infra": round(shared_infra, 4),
-            "shared_iocs": round(shared_iocs, 4),
-            "temporal_overlap": round(temporal, 4),
-        },
-        "preferred_registrar": None,
-        "preferred_asn": None,
-        "exfil_channels": [],
-        "target_brands": [],
-    }
-
-    # Collect all cluster IDs across both campaigns.
-    campaign_ids = [camp_a.id, camp_b.id]
-    cluster_ids: set[str] = set()
-    for cid in campaign_ids:
-        rows = (
-            session.query(CampaignClusterModel)
-            .filter(CampaignClusterModel.campaign_id == cid)
-            .all()
-        )
-        cluster_ids.update(r.cluster_id for r in rows)
-
-    # Domain IDs from all clusters.
-    domain_ids: set[str] = set()
-    for cluster_id in cluster_ids:
-        members = (
-            session.query(ClusterMemberModel)
-            .filter(ClusterMemberModel.cluster_id == cluster_id)
-            .all()
-        )
-        domain_ids.update(m.domain_id for m in members)
-
-    # Preferred registrar: most frequent registrar among domain IPs.
-    registrar_counts: dict[str, int] = defaultdict(int)
-    asn_counts: dict[str, int] = defaultdict(int)
-    for did in domain_ids:
-        domain = session.query(DomainModel).get(did)
-        if domain is None:
-            continue
-        registrar = getattr(domain, "registrar", None)
-        if registrar:
-            registrar_counts[registrar] += 1
-        ip_row = (
-            session.query(DomainIpModel)
-            .filter(DomainIpModel.domain_id == did)
-            .order_by(DomainIpModel.first_seen)
-            .first()
-        )
-        if ip_row and hasattr(ip_row, "asn") and ip_row.asn:
-            asn_counts[str(ip_row.asn)] += 1
-
-    if registrar_counts:
-        fingerprint["preferred_registrar"] = max(
-            registrar_counts, key=registrar_counts.get  # type: ignore[arg-type]
-        )
-    if asn_counts:
-        fingerprint["preferred_asn"] = max(
-            asn_counts, key=asn_counts.get  # type: ignore[arg-type]
-        )
-
-    # Exfil channels: IOC values with role=exfil_endpoint across campaign domains.
-    snapshot_ids = {
-        s.id
-        for s in session.query(SnapshotModel)
-        .filter(SnapshotModel.domain_id.in_(domain_ids))
-        .all()
-    }
-    if snapshot_ids:
-        exfil_iocs = (
-            session.query(IocModel)
-            .join(IocOccurrenceModel, IocModel.id == IocOccurrenceModel.ioc_id)
-            .filter(
-                IocOccurrenceModel.snapshot_id.in_(snapshot_ids),
-                IocOccurrenceModel.role == "exfil_endpoint",
-            )
-            .distinct()
-            .all()
-        )
-        fingerprint["exfil_channels"] = list(
-            {ioc.value for ioc in exfil_iocs}
-        )[:20]  # cap at 20
-
-    # Target brands: combine from both campaigns.
-    target_brands: set[str] = set()
-    if camp_a.target_brand:
-        target_brands.add(camp_a.target_brand)
-    if camp_b.target_brand:
-        target_brands.add(camp_b.target_brand)
-    fingerprint["target_brands"] = sorted(target_brands)
-
-    return fingerprint
 
 
 def _generate_label(confidence: float, fingerprint: dict) -> str:
@@ -565,9 +343,13 @@ def profile_actors(session) -> dict:
     for d in all_domains:
         domain_registrar_map[d.id] = getattr(d, "registrar", None)
 
-    all_ips = session.query(DomainIpModel).all()
+    all_ips = (
+        session.query(DomainIpModel)
+        .filter(DomainIpModel.domain_id.in_(all_domain_ids_in_clusters))
+        .all()
+    )
     for ip_row in all_ips:
-        if ip_row.domain_id in all_domain_ids_in_clusters and hasattr(ip_row, "asn") and ip_row.asn:
+        if hasattr(ip_row, "asn") and ip_row.asn:
             domain_asn_map.setdefault(ip_row.domain_id, str(ip_row.asn))
 
     # Pre-load exfil IOCs for fingerprint building
