@@ -17,6 +17,7 @@ class PipelineMetrics:
     alerts_sent: int = 0
     alerts_failed: int = 0
     start_time: float = field(default_factory=time.time)
+    queue_depth: int = 0
     _processing_times: list = field(default_factory=list)
 
     def record_domain_processed(self) -> None:
@@ -43,6 +44,22 @@ class PipelineMetrics:
     def record_alert_failed(self) -> None:
         with self._lock:
             self.alerts_failed += 1
+
+    def record_success(self, duration_s: float) -> None:
+        """Record pipeline run latency. Count is tracked by record_domain_processed()."""
+        with self._lock:
+            self._processing_times.append(duration_s)
+
+    def record_failure(self) -> None:
+        with self._lock:
+            self.domains_failed += 1
+
+    def set_queue_depth(self, depth: int) -> None:
+        with self._lock:
+            self.queue_depth = int(depth)
+
+    def get_stats(self) -> dict:
+        return self.summary()
 
     @property
     def avg_processing_time(self) -> float:
@@ -79,8 +96,9 @@ class PipelineMetrics:
             "p99_processing_time_s": round(self.p99_processing_time, 4),
             "throughput_per_second": round(self.throughput_per_second, 2),
             "elapsed_s": round(time.time() - self.start_time, 2),
+            "queue_depth": self.queue_depth,
         }
 
 
-# Module-level singleton
-metrics = PipelineMetrics()
+pipeline_metrics = PipelineMetrics()
+metrics = pipeline_metrics  # backwards-compatible alias
