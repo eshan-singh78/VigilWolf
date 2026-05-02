@@ -518,6 +518,22 @@ def orchestrate_analysis(ctx: SnapshotContext) -> None:
         # Aggregate results and score
         aggregate_results(ctx, all_results)
 
+        # Persist IOC extraction results if ioc_extractor ran successfully
+        ioc_results = [r for r in all_results if r.plugin_name == "ioc_extractor" and not r.error]
+        if ioc_results:
+            try:
+                from services.ioc_service import persist_iocs
+                with get_session() as ioc_session:
+                    for ioc_result in ioc_results:
+                        persist_iocs(
+                            snapshot_id=ctx.snapshot_id,
+                            findings=ioc_result.findings,
+                            session=ioc_session,
+                        )
+                    logger.info("Persisted IOC results for snapshot_id=%s", ctx.snapshot_id)
+            except Exception:
+                logger.exception("Failed to persist IOCs for snapshot_id=%s", ctx.snapshot_id)
+
         # Increment Prometheus counter for domains processed
         _inc_domains_processed()
 
