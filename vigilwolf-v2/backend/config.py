@@ -118,6 +118,15 @@ ALERTS_ENABLED = os.getenv("ALERTS_ENABLED", "false").lower() == "true"
 ALERTS_DRY_RUN = os.getenv("ALERTS_DRY_RUN", "false").lower() == "true"
 
 # ---------------------------------------------------------------------------
+# v2 — Intelligence pipeline flags (Phase 2 & 3)
+# ---------------------------------------------------------------------------
+INTELLIGENCE_PIPELINE_ENABLED = os.getenv("INTELLIGENCE_PIPELINE_ENABLED", "false").lower() == "true"
+CAMPAIGN_DETECTION_ENABLED = os.getenv("CAMPAIGN_DETECTION_ENABLED", "false").lower() == "true"
+PHISHKIT_DETECTION_ENABLED = os.getenv("PHISHKIT_DETECTION_ENABLED", "false").lower() == "true"
+ACTOR_PROFILING_ENABLED = os.getenv("ACTOR_PROFILING_ENABLED", "false").lower() == "true"
+C2_DETECTION_ENABLED = os.getenv("C2_DETECTION_ENABLED", "false").lower() == "true"
+
+# ---------------------------------------------------------------------------
 # v2 — Per-plugin feature flags
 # ---------------------------------------------------------------------------
 ENABLED_PLUGINS = os.getenv(
@@ -224,6 +233,11 @@ def get_config_summary() -> dict:
             "alerts_enabled": ALERTS_ENABLED,
             "alerts_dry_run": ALERTS_DRY_RUN,
             "enabled_plugins": ENABLED_PLUGINS,
+            "intelligence_pipeline_enabled": INTELLIGENCE_PIPELINE_ENABLED,
+            "campaign_detection_enabled": CAMPAIGN_DETECTION_ENABLED,
+            "phishkit_detection_enabled": PHISHKIT_DETECTION_ENABLED,
+            "actor_profiling_enabled": ACTOR_PROFILING_ENABLED,
+            "c2_detection_enabled": C2_DETECTION_ENABLED,
         },
         "v2_risk": {
             "risk_threshold_high": RISK_THRESHOLD_HIGH,
