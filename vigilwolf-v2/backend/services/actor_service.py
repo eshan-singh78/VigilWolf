@@ -15,6 +15,8 @@ from collections import defaultdict
 from datetime import datetime, timezone
 from typing import Optional
 
+from sqlalchemy.exc import IntegrityError
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -25,9 +27,13 @@ WEIGHT_SHARED_INFRA = 0.3
 WEIGHT_SHARED_IOCS = 0.2
 WEIGHT_TEMPORAL = 0.2
 
+MAX_CAMPAIGNS_PER_PROFILE = 500
+
 # Confidence thresholds
-CONFIDENCE_THRESHOLD = 0.5
+CONFIDENCE_THRESHOLD = 0.6
 LIKELY_SAME_THRESHOLD = 0.8
+INFRA_CONFIDENCE_THRESHOLD = 0.7
+MIN_INFRA_OVERLAP_COUNT = 3
 
 
 # ---------------------------------------------------------------------------
@@ -347,6 +353,89 @@ def _generate_label(confidence: float, fingerprint: dict) -> str:
     return f"POSSIBLE_{tag}"
 
 
+def _build_fingerprint_fast(
+    camp_a,
+    camp_b,
+    shared_kit: float,
+    shared_infra: float,
+    shared_iocs: float,
+    temporal: float,
+    infra_overlap_count: int,
+    campaign_cluster_map: dict,
+    cluster_type_map: dict,
+    cluster_domain_map: dict,
+    domain_registrar_map: dict,
+    domain_asn_map: dict,
+    domain_snapshot_map: dict,
+    snapshot_ioc_map: dict,
+    exfil_ioc_map: dict,
+) -> dict:
+    """Build the actor fingerprint JSON blob using pre-loaded data.
+
+    Aggregates shared signals and derives preferred registrar, ASN, exfil
+    channels, and target brands from the pre-loaded dictionaries, avoiding
+    per-pair DB queries.
+    """
+    # F-2 fix: suppress infra signal in fingerprint when overlap count is too low
+    effective_shared_infra = shared_infra if infra_overlap_count >= MIN_INFRA_OVERLAP_COUNT else 0.0
+    fingerprint: dict = {
+        "shared_signals": {
+            "shared_kit": round(shared_kit, 4),
+            "shared_infra": round(effective_shared_infra, 4),
+            "shared_iocs": round(shared_iocs, 4),
+            "temporal_overlap": round(temporal, 4),
+        },
+        "preferred_registrar": None,
+        "preferred_asn": None,
+        "exfil_channels": [],
+        "target_brands": [],
+    }
+
+    # Collect all domain IDs across both campaigns' clusters.
+    campaign_ids = [camp_a.id, camp_b.id]
+    all_domain_ids: set[str] = set()
+    for cid in campaign_ids:
+        for cluster_id in campaign_cluster_map.get(cid, set()):
+            all_domain_ids.update(cluster_domain_map.get(cluster_id, set()))
+
+    # Preferred registrar and ASN from pre-loaded data.
+    registrar_counts: dict[str, int] = {}
+    asn_counts: dict[str, int] = {}
+    for did in all_domain_ids:
+        registrar = domain_registrar_map.get(did)
+        if registrar:
+            registrar_counts[registrar] = registrar_counts.get(registrar, 0) + 1
+        asn = domain_asn_map.get(did)
+        if asn:
+            asn_counts[asn] = asn_counts.get(asn, 0) + 1
+
+    if registrar_counts:
+        fingerprint["preferred_registrar"] = max(
+            registrar_counts, key=registrar_counts.get  # type: ignore[arg-type]
+        )
+    if asn_counts:
+        fingerprint["preferred_asn"] = max(
+            asn_counts, key=asn_counts.get  # type: ignore[arg-type]
+        )
+
+    # Exfil channels from pre-loaded data.
+    exfil_values: set[str] = set()
+    for did in all_domain_ids:
+        for val in exfil_ioc_map.get(did, []):
+            exfil_values.add(val)
+    fingerprint["exfil_channels"] = sorted(exfil_values)[:20]
+
+    # Target brands: combine from both campaigns.
+    target_brands: set[str] = set()
+    if camp_a.target_brand:
+        target_brands.add(camp_a.target_brand)
+    if camp_b.target_brand:
+        target_brands.add(camp_b.target_brand)
+    fingerprint["target_brands"] = sorted(target_brands)
+
+    return fingerprint
+
+
 # ---------------------------------------------------------------------------
 # Core service functions
 # ---------------------------------------------------------------------------
@@ -361,7 +450,7 @@ def profile_actors(session) -> dict:
         confidence = (shared_kit * 0.3) + (shared_infra * 0.3)
                    + (shared_iocs * 0.2) + (temporal_overlap * 0.2)
 
-    If confidence > 0.5, an ActorModel is created (or updated) linking both
+    If confidence > 0.6, an ActorModel is created (or updated) linking both
     campaigns via ActorCampaignModel rows.  The actor label is derived from
     the confidence level and a deterministic hash of the shared signals.
 
@@ -382,14 +471,158 @@ def profile_actors(session) -> dict:
         logger.info("profile_actors: fewer than 2 campaigns, nothing to profile.")
         return {"actors_created": 0, "actors_updated": 0}
 
+    if len(campaigns) > MAX_CAMPAIGNS_PER_PROFILE:
+        logger.warning(
+            "profile_actors: %d campaigns exceeds MAX_CAMPAIGNS_PER_PROFILE (%d); "
+            "using first %d campaigns only.",
+            len(campaigns), MAX_CAMPAIGNS_PER_PROFILE, MAX_CAMPAIGNS_PER_PROFILE,
+        )
+        campaigns = campaigns[:MAX_CAMPAIGNS_PER_PROFILE]
+
+    # Pre-load all data needed for pairwise comparison
+    from database import (  # type: ignore[import-untyped]
+        CampaignClusterModel,
+        ClusterMemberModel,
+        ClusterModel,
+        DomainIpModel,
+        DomainModel,
+        IocModel,
+        IocOccurrenceModel,
+        SnapshotModel,
+    )
+
+    # Pre-load campaign -> cluster IDs
+    campaign_cluster_map: dict[str, set[str]] = {}
+    all_cluster_links = session.query(CampaignClusterModel).all()
+    for link in all_cluster_links:
+        campaign_cluster_map.setdefault(link.campaign_id, set()).add(link.cluster_id)
+
+    # Pre-load cluster types for infra filtering
+    cluster_type_map: dict[str, str] = {}
+    all_clusters = session.query(ClusterModel).all()
+    for c in all_clusters:
+        cluster_type_map[c.id] = c.cluster_type
+
+    # Pre-load cluster -> domain mappings
+    cluster_domain_map: dict[str, set[str]] = {}
+    all_members = session.query(ClusterMemberModel).all()
+    for m in all_members:
+        cluster_domain_map.setdefault(m.cluster_id, set()).add(m.domain_id)
+
+    # C-2 fix: Collect relevant domain IDs from clusters linked to active campaigns
+    relevant_domain_ids: set[str] = set()
+    for cluster_ids in campaign_cluster_map.values():
+        for cluster_id in cluster_ids:
+            relevant_domain_ids.update(cluster_domain_map.get(cluster_id, set()))
+
+    # Pre-load domain -> snapshot mappings (filtered to relevant domains only)
+    domain_snapshot_map: dict[str, set[str]] = {}
+    if relevant_domain_ids:
+        filtered_snapshots = session.query(SnapshotModel).filter(
+            SnapshotModel.domain_id.in_(relevant_domain_ids)
+        ).all()
+        for s in filtered_snapshots:
+            domain_snapshot_map.setdefault(s.domain_id, set()).add(s.id)
+
+    # C-2 fix: Collect relevant snapshot IDs from filtered domain_snapshot_map
+    relevant_snapshot_ids: set[str] = set()
+    for sids in domain_snapshot_map.values():
+        relevant_snapshot_ids.update(sids)
+
+    # Pre-load snapshot -> IOC mappings (filtered to relevant snapshots only)
+    snapshot_ioc_map: dict[str, set[int]] = {}
+    if relevant_snapshot_ids:
+        filtered_occurrences = session.query(IocOccurrenceModel).filter(
+            IocOccurrenceModel.snapshot_id.in_(relevant_snapshot_ids)
+        ).all()
+        for occ in filtered_occurrences:
+            snapshot_ioc_map.setdefault(occ.snapshot_id, set()).add(occ.ioc_id)
+
+    # Pre-compute campaign -> IOC IDs mapping
+    campaign_ioc_map: dict[str, set[int]] = {}
+    for camp in campaigns:
+        camp_clusters = campaign_cluster_map.get(camp.id, set())
+        domain_ids: set[str] = set()
+        for cid in camp_clusters:
+            domain_ids.update(cluster_domain_map.get(cid, set()))
+
+        ioc_ids: set[int] = set()
+        for did in domain_ids:
+            for sid in domain_snapshot_map.get(did, set()):
+                ioc_ids.update(snapshot_ioc_map.get(sid, set()))
+        campaign_ioc_map[camp.id] = ioc_ids
+
+    # Pre-load domain attributes for fingerprint building
+    domain_registrar_map: dict[str, str | None] = {}
+    domain_asn_map: dict[str, str | None] = {}
+    all_domain_ids_in_clusters = set()
+    for dids in cluster_domain_map.values():
+        all_domain_ids_in_clusters.update(dids)
+
+    all_domains = session.query(DomainModel).filter(
+        DomainModel.id.in_(all_domain_ids_in_clusters)
+    ).all() if all_domain_ids_in_clusters else []
+    for d in all_domains:
+        domain_registrar_map[d.id] = getattr(d, "registrar", None)
+
+    all_ips = session.query(DomainIpModel).all()
+    for ip_row in all_ips:
+        if ip_row.domain_id in all_domain_ids_in_clusters and hasattr(ip_row, "asn") and ip_row.asn:
+            domain_asn_map.setdefault(ip_row.domain_id, str(ip_row.asn))
+
+    # Pre-load exfil IOCs for fingerprint building
+    exfil_ioc_map: dict[str, list[str]] = {}  # domain_id -> [ioc_value, ...]
+    all_exfil = (
+        session.query(IocOccurrenceModel, IocModel)
+        .join(IocModel, IocOccurrenceModel.ioc_id == IocModel.id)
+        .filter(IocOccurrenceModel.role == "exfil_endpoint", IocModel.type == "url")
+        .all()
+    )
+    for occ, ioc in all_exfil:
+        # Resolve domain via snapshot
+        snap = session.query(SnapshotModel).get(occ.snapshot_id)
+        if snap:
+            exfil_ioc_map.setdefault(snap.domain_id, []).append(ioc.value)
+
+    # Pre-load ALL existing actor-campaign mappings to avoid per-pair queries
+    actor_campaign_pairs: dict[frozenset[str], str] = {}  # {camp_id_a, camp_id_b} -> actor_id
+    all_actor_links = session.query(ActorCampaignModel).all()
+    actor_link_map: dict[str, list[str]] = {}  # actor_id -> [campaign_ids]
+    for link in all_actor_links:
+        actor_link_map.setdefault(link.actor_id, []).append(link.campaign_id)
+
+    for actor_id, camp_ids in actor_link_map.items():
+        for i in range(len(camp_ids)):
+            for j in range(i + 1, len(camp_ids)):
+                pair_key = frozenset([camp_ids[i], camp_ids[j]])
+                actor_campaign_pairs[pair_key] = actor_id
+
+    # Pre-load all actors for updates
+    all_actors = {a.id: a for a in session.query(ActorModel).all()}
+
     actors_created = 0
     actors_updated = 0
 
     # Compare every unique pair of campaigns.
     for camp_a, camp_b in itertools.combinations(campaigns, 2):
-        shared_kit = _compute_shared_kit(camp_a, camp_b, session)
-        shared_infra = _compute_shared_infra(camp_a, camp_b, session)
-        shared_iocs = _compute_shared_iocs(camp_a, camp_b, session)
+        sig_a = camp_a.kit_signature
+        sig_b = camp_b.kit_signature
+        shared_kit = 1.0 if (sig_a and sig_b and sig_a == sig_b) else 0.0
+
+        # Use pre-loaded cluster data
+        clusters_a = campaign_cluster_map.get(camp_a.id, set())
+        clusters_b = campaign_cluster_map.get(camp_b.id, set())
+        infra_a = {cid for cid in clusters_a if cluster_type_map.get(cid) == "infra"}
+        infra_b = {cid for cid in clusters_b if cluster_type_map.get(cid) == "infra"}
+        infra_overlap_count = len(infra_a & infra_b)
+        shared_infra = _jaccard(infra_a, infra_b)
+        # F-2 fix: suppress infra signal when overlap is too sparse or confidence too low
+        if shared_infra < INFRA_CONFIDENCE_THRESHOLD or infra_overlap_count < MIN_INFRA_OVERLAP_COUNT:
+            shared_infra = 0.0
+
+        iocs_a = campaign_ioc_map.get(camp_a.id, set())
+        iocs_b = campaign_ioc_map.get(camp_b.id, set())
+        shared_iocs = _jaccard(iocs_a, iocs_b)
         temporal = _temporal_overlap(
             camp_a.first_seen, camp_a.last_seen,
             camp_b.first_seen, camp_b.last_seen,
@@ -409,54 +642,34 @@ def profile_actors(session) -> dict:
             )
             continue
 
-        # Build fingerprint before finding/creating actor.
-        fingerprint = _build_fingerprint(
-            camp_a, camp_b, shared_kit, shared_infra, shared_iocs, temporal, session,
+        # Build fingerprint using pre-loaded data (no DB queries)
+        fingerprint = _build_fingerprint_fast(
+            camp_a, camp_b, shared_kit, shared_infra, shared_iocs, temporal,
+            infra_overlap_count,
+            campaign_cluster_map, cluster_type_map, cluster_domain_map,
+            domain_registrar_map, domain_asn_map, domain_snapshot_map,
+            snapshot_ioc_map, exfil_ioc_map,
         )
         label = _generate_label(confidence, fingerprint)
 
-        # Check if an actor already links these two campaigns.
-        existing = (
-            session.query(ActorModel)
-            .join(ActorCampaignModel, ActorModel.id == ActorCampaignModel.actor_id)
-            .filter(ActorCampaignModel.campaign_id == camp_a.id)
-            .all()
-        )
-        existing_actor = None
-        for actor in existing:
-            # Does this actor also link camp_b?
-            link = (
-                session.query(ActorCampaignModel)
-                .filter(
-                    ActorCampaignModel.actor_id == actor.id,
-                    ActorCampaignModel.campaign_id == camp_b.id,
-                )
-                .first()
-            )
-            if link is not None:
-                existing_actor = actor
-                break
-
         now = datetime.now(timezone.utc)
 
-        if existing_actor is not None:
+        # Check if an actor already links these two campaigns using pre-loaded data
+        pair_key = frozenset([camp_a.id, camp_b.id])
+        existing_actor_id = actor_campaign_pairs.get(pair_key)
+
+        if existing_actor_id is not None and existing_actor_id in all_actors:
             # Update existing actor.
+            existing_actor = all_actors[existing_actor_id]
             existing_actor.confidence_score = confidence
             existing_actor.fingerprint = fingerprint
             existing_actor.label = label
             existing_actor.last_seen = now
-            # Merge meta: preserve any existing keys.
-            meta = existing_actor.meta or {}
-            meta.update({
+            existing_actor.meta = {
+                **(existing_actor.meta or {}),
                 "last_profiled": now.isoformat(),
-                "campaign_ids": sorted(list({
-                    r.campaign_id
-                    for r in session.query(ActorCampaignModel)
-                    .filter(ActorCampaignModel.actor_id == existing_actor.id)
-                    .all()
-                })),
-            })
-            existing_actor.meta = meta
+                "campaign_ids": sorted(actor_link_map.get(existing_actor_id, [])),
+            }
             actors_updated += 1
             logger.debug(
                 "Updated actor %s (%s) confidence=%.3f",
@@ -465,35 +678,77 @@ def profile_actors(session) -> dict:
         else:
             # Create new actor linking both campaigns.
             actor_id = str(uuid.uuid4())
-            actor = ActorModel(
-                id=actor_id,
-                label=label,
-                fingerprint=fingerprint,
-                confidence_score=confidence,
-                first_seen=now,
-                last_seen=now,
-                meta={
-                    "last_profiled": now.isoformat(),
-                    "campaign_ids": [camp_a.id, camp_b.id],
-                },
-            )
-            session.add(actor)
-            session.flush()  # ensure actor.id is available
+            try:
+                with session.begin_nested():
+                    actor = ActorModel(
+                        id=actor_id,
+                        label=label,
+                        fingerprint=fingerprint,
+                        confidence_score=confidence,
+                        first_seen=now,
+                        last_seen=now,
+                        meta={
+                            "last_profiled": now.isoformat(),
+                            "campaign_ids": [camp_a.id, camp_b.id],
+                        },
+                    )
+                    session.add(actor)
+                    session.flush()  # ensure actor.id is available
 
-            # Create campaign links.
-            session.add(ActorCampaignModel(
-                actor_id=actor.id,
-                campaign_id=camp_a.id,
-            ))
-            session.add(ActorCampaignModel(
-                actor_id=actor.id,
-                campaign_id=camp_b.id,
-            ))
-            actors_created += 1
-            logger.info(
-                "Created actor %s (%s) confidence=%.3f linking campaigns %s and %s",
-                actor.id[:8], label, confidence, camp_a.id[:8], camp_b.id[:8],
-            )
+                    # Create campaign links.
+                    session.add(ActorCampaignModel(
+                        actor_id=actor.id,
+                        campaign_id=camp_a.id,
+                    ))
+                    session.add(ActorCampaignModel(
+                        actor_id=actor.id,
+                        campaign_id=camp_b.id,
+                    ))
+                actors_created += 1
+                # Update pre-loaded data for subsequent pairs
+                all_actors[actor.id] = actor
+                actor_link_map[actor.id] = [camp_a.id, camp_b.id]
+                actor_campaign_pairs[frozenset([camp_a.id, camp_b.id])] = actor.id
+
+                logger.info(
+                    "Created actor %s (%s) confidence=%.3f linking campaigns %s and %s",
+                    actor.id[:8], label, confidence, camp_a.id[:8], camp_b.id[:8],
+                )
+            except IntegrityError:
+                # H-5 fix: Duplicate label — recover by linking campaigns to existing actor.
+                logger.debug(
+                    "Duplicate actor label '%s' for campaign pair %s/%s — recovering",
+                    label, camp_a.id[:8], camp_b.id[:8],
+                )
+                existing_actor = session.query(ActorModel).filter(
+                    ActorModel.label == label
+                ).first()
+                if existing_actor is not None:
+                    existing_actor.last_seen = now
+                    existing_camp_ids = set(actor_link_map.get(existing_actor.id, []))
+                    new_camp_ids = set()
+                    for camp_id in (camp_a.id, camp_b.id):
+                        if camp_id not in existing_camp_ids:
+                            session.add(ActorCampaignModel(
+                                actor_id=existing_actor.id,
+                                campaign_id=camp_id,
+                            ))
+                            new_camp_ids.add(camp_id)
+                    # Update in-memory maps for subsequent pairs
+                    all_camp_ids = existing_camp_ids | new_camp_ids
+                    actor_link_map[existing_actor.id] = list(all_camp_ids)
+                    all_actors[existing_actor.id] = existing_actor
+                    # Rebuild actor_campaign_pairs for this actor
+                    camp_ids_list = list(all_camp_ids)
+                    for i in range(len(camp_ids_list)):
+                        for j in range(i + 1, len(camp_ids_list)):
+                            actor_campaign_pairs[frozenset([camp_ids_list[i], camp_ids_list[j]])] = existing_actor.id
+                    existing_actor.meta = {
+                        **(existing_actor.meta or {}),
+                        "last_profiled": now.isoformat(),
+                        "campaign_ids": sorted(all_camp_ids),
+                    }
+                    actors_updated += 1
 
     session.flush()
     logger.info(
