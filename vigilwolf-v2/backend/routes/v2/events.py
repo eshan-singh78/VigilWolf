@@ -1,11 +1,12 @@
 """VigilWolf v2 — Server-Sent Events (SSE) endpoint for real-time updates.
 
 Provides a single ``GET /api/v2/events`` endpoint that streams events to
-connected clients. The endpoint is intentionally placed **outside** the
-API-key-authenticated router so that SSE clients can connect without
-passing a header-based API key (SSE browsers don't support custom headers
-natively; authentication is expected to come from query-param tokens or
-a separate mechanism in the future).
+connected clients. Authentication is enforced via the X-API-Key header
+(the SSE endpoint is now mounted under the authenticated v2 router).
+
+For browser EventSource connections that cannot set custom headers, clients
+should use a proxy or token-based short-lived access mechanism. The insecure
+query-param API key approach has been removed.
 
 Event types:
   - ``threat_detected`` — a domain received a high/medium risk score
@@ -35,6 +36,11 @@ router = APIRouter()
 # Seconds between heartbeat keep-alive comments when no real events arrive
 HEARTBEAT_INTERVAL = 15
 
+# Maximum concurrent SSE connections to prevent resource exhaustion
+MAX_SSE_CONNECTIONS = 50
+
+_connection_semaphore = asyncio.Semaphore(MAX_SSE_CONNECTIONS)
+
 
 # ---------------------------------------------------------------------------
 # SSE generator
@@ -46,35 +52,38 @@ async def _event_generator(request: Request) -> AsyncIterator[str]:
     Subscribes to the global :pydata:`event_bus`, yields real events as
     they arrive, and falls back to heartbeat comments when the queue is
     idle for more than ``HEARTBEAT_INTERVAL`` seconds.
+
+    Connection limiting is handled atomically via
+    :pydata:`_connection_semaphore`.
     """
-    queue = event_bus.subscribe()
-    try:
-        while True:
-            # Allow the client to disconnect cleanly
-            if await request.is_disconnected():
-                logger.info("SSE client disconnected")
-                break
+    async with _connection_semaphore:
+        queue = event_bus.subscribe()
+        stream = event_bus.iter_events(queue)
+        try:
+            while True:
+                if await request.is_disconnected():
+                    logger.info("SSE client disconnected")
+                    break
 
-            try:
-                event_type, data = await asyncio.wait_for(
-                    queue.get(), timeout=HEARTBEAT_INTERVAL
-                )
-            except asyncio.TimeoutError:
-                # No event arrived — send heartbeat to keep connection alive
-                yield ": heartbeat\n\n"
-                continue
+                try:
+                    event_type, data = await asyncio.wait_for(
+                        anext(stream), timeout=HEARTBEAT_INTERVAL
+                    )
+                except asyncio.TimeoutError:
+                    yield ": heartbeat\n\n"
+                    continue
 
-            payload = {
-                "event": event_type,
-                "data": data,
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-            }
-            yield f"data: {json.dumps(payload)}\n\n"
+                payload = {
+                    "event": event_type,
+                    "data": data,
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                }
+                yield f"data: {json.dumps(payload)}\n\n"
 
-    except asyncio.CancelledError:
-        logger.info("SSE generator cancelled (client disconnected)")
-    finally:
-        event_bus.unsubscribe(queue)
+        except asyncio.CancelledError:
+            logger.info("SSE generator cancelled (client disconnected)")
+        finally:
+            event_bus.unsubscribe(queue)
 
 
 # ---------------------------------------------------------------------------
@@ -85,17 +94,19 @@ async def _event_generator(request: Request) -> AsyncIterator[str]:
 async def sse_events(request: Request) -> StreamingResponse:
     """SSE stream for real-time threat and processing updates.
 
-    This endpoint does **not** require an API-key header. SSE connections
-    from browsers cannot set custom HTTP headers on the ``EventSource``
-    object, so auth must be handled via query parameters or cookies if
-    needed in the future.
+    Auth is enforced via the X-API-Key header (mounted under the authenticated
+    v2 router). Connection limit enforced to prevent resource exhaustion.
     """
+    if _connection_semaphore._value <= 0:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=429, detail="Too many SSE connections")
+
     return StreamingResponse(
         _event_generator(request),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
             "Connection": "keep-alive",
-            "X-Accel-Buffering": "no",  # disable nginx buffering
+            "X-Accel-Buffering": "no",
         },
     )
