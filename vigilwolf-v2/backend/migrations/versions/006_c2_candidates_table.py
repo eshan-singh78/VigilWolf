@@ -10,7 +10,7 @@ import sqlalchemy as sa
 
 
 revision = "006_c2_candidates_table"
-down_revision = "005_phishkit_unique_constraint"
+down_revision = "005_clustering_watermark"
 branch_labels = None
 depends_on = None
 

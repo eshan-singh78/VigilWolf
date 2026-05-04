@@ -9,7 +9,7 @@ from alembic import op
 
 
 revision = "009_analysis_result_composite"
-down_revision = "007_c2_unique"
+down_revision = "008_ioc_value_hash"
 branch_labels = None
 depends_on = None
 

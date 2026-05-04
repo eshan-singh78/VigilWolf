@@ -10,7 +10,7 @@ from alembic import op
 
 # revision identifiers, used by Alembic.
 revision = "003_performance_indexes"
-down_revision = "002_intelligence_tables"
+down_revision = "002"
 branch_labels = None
 depends_on = None
 
