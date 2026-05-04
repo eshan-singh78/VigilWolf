@@ -14,6 +14,7 @@ from typing import Optional
 from urllib.parse import urlparse
 
 from sqlalchemy import func
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 logger = logging.getLogger(__name__)
@@ -35,9 +36,18 @@ def _normalize_ioc_value(ioc_type: str, value: str) -> str:
         return value.lower()
     if ioc_type == "url":
         parsed = urlparse(value)
+        # Lowercase the scheme (HTTP -> http)
+        parsed = parsed._replace(scheme=parsed.scheme.lower())
+        # Strip URL fragments (they are client-side only and not relevant for IOC identity)
+        parsed = parsed._replace(fragment="")
         if parsed.hostname:
             normalized_netloc = parsed.hostname.lower()
-            if parsed.port:
+            # Strip default ports (80 for http, 443 for https)
+            if parsed.port and parsed.port == 80 and parsed.scheme == "http":
+                pass  # omit default port
+            elif parsed.port and parsed.port == 443 and parsed.scheme == "https":
+                pass  # omit default port
+            elif parsed.port:
                 normalized_netloc = f"{normalized_netloc}:{parsed.port}"
             # Lowercase path segments but preserve query parameter values
             normalized_path = parsed.path.lower()
@@ -300,7 +310,7 @@ def persist_iocs(
                     else:
                         existing_check.last_seen = now
                         ioc_id = existing_check.id
-            except Exception:
+            except IntegrityError:
                 # IntegrityError from concurrent insert — query the existing row
                 logger.debug("IOC value already exists: %s", normalized[:50])
                 existing = (
@@ -313,6 +323,13 @@ def persist_iocs(
                     continue
                 existing.last_seen = now
                 ioc_id = existing.id
+            except Exception:
+                logger.error(
+                    "Unexpected error persisting IOC value=%s; skipping.",
+                    normalized[:50],
+                    exc_info=True,
+                )
+                continue
 
             snapshot_ioc_ids.append(ioc_id)
 
@@ -333,8 +350,14 @@ def persist_iocs(
                     session.add(occurrence)
                     session.flush()
                 occurrences_created += 1
-            except Exception:
+            except IntegrityError:
                 logger.debug("IOC occurrence already exists: ioc_id=%d snapshot=%s", ioc_id, snapshot_id)
+            except Exception:
+                logger.error(
+                    "Unexpected error persisting IOC occurrence ioc_id=%d snapshot=%s",
+                    ioc_id, snapshot_id,
+                    exc_info=True,
+                )
 
     # Build relationships -------------------------------------------------
 
@@ -367,10 +390,16 @@ def persist_iocs(
                     session.add(rel)
                     session.flush()
                 relationships_created += 1
-            except Exception:
+            except IntegrityError:
                 logger.debug(
                     "IOC relationship already exists: %d -> %d (same_page)",
                     src_id, tgt_id,
+                )
+            except Exception:
+                logger.error(
+                    "Unexpected error persisting IOC relationship %d -> %d (same_page)",
+                    src_id, tgt_id,
+                    exc_info=True,
                 )
 
     # script_load: script src URLs are linked to the domain they are loaded on
@@ -410,10 +439,16 @@ def persist_iocs(
                         session.add(rel)
                         session.flush()
                     relationships_created += 1
-                except Exception:
+                except IntegrityError:
                     logger.debug(
                         "IOC relationship already exists: %d -> %d (script_load)",
                         domain_id, url_id,
+                    )
+                except Exception:
+                    logger.error(
+                        "Unexpected error persisting IOC relationship %d -> %d (script_load)",
+                        domain_id, url_id,
+                        exc_info=True,
                     )
 
     session.flush()
