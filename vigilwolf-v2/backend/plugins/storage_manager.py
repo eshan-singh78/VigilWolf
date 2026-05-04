@@ -71,3 +71,34 @@ def save_snapshot(domain_id: str, snapshot_id: str, html: str) -> dict:
         raise
 
     return {"html_path": str(html_path), "assets_dir": str(root)}
+
+
+def load_snapshot(domain_id: str, snapshot_id: str) -> dict | None:
+    """Load a snapshot's HTML from storage.
+
+    Returns a dict with ``html`` and ``html_path`` keys, or None if the
+    snapshot file does not exist.
+    """
+    safe_domain = _sanitize_path_component(domain_id, "domain_id")
+    safe_snapshot = _sanitize_path_component(snapshot_id, "snapshot_id")
+
+    html_path = _SNAPSHOTS_BASE / safe_domain / safe_snapshot / "page.html"
+
+    if not html_path.is_file():
+        return None
+
+    # Defense in depth: verify resolved path is within snapshots dir
+    try:
+        html_path.resolve().relative_to(_SNAPSHOTS_BASE.resolve())
+    except ValueError:
+        raise ValueError(
+            f"Path traversal detected: resolved path {html_path.resolve()} "
+            f"is outside snapshots directory {_SNAPSHOTS_BASE.resolve()}"
+        )
+
+    try:
+        html = html_path.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return None
+
+    return {"html": html, "html_path": str(html_path)}
