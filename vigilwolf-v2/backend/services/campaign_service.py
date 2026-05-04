@@ -139,6 +139,10 @@ def _detect_brand(domain_urls: list[str]) -> Optional[str]:
     matches against the hostname only (not the path/query), reducing
     false positives from URL paths like /uploads/ or /verify/.
 
+    Uses a scoring heuristic to pick the best match when multiple brands
+    are detected: exact SLD match = 3 points, subdomain match = 1 point,
+    longer keyword = +1 point.  Returns the highest-scoring brand.
+
     Short keywords (< 4 chars) and denylisted infrastructure/generic
     terms are skipped to prevent false positives.
     """
@@ -164,6 +168,9 @@ def _detect_brand(domain_urls: list[str]) -> Optional[str]:
         return None
 
     combined = " ".join(hostnames)
+
+    # Collect ALL matching brands with scores.
+    brand_scores: dict[str, int] = {}
     for keyword, brand in BRAND_KEYWORDS:
         # Skip short keywords and denylisted terms to reduce false positives.
         if len(keyword) < _BRAND_MIN_LENGTH or keyword.lower() in _BRAND_DENYLIST:
@@ -172,9 +179,29 @@ def _detect_brand(domain_urls: list[str]) -> Optional[str]:
         # Hostnames use dots as separators, so match between dots/dashes.
         pattern = rf"(?:^|[.-]){re.escape(keyword)}(?:[.-]|$)"
         if re.search(pattern, combined):
-            return brand
+            score = 0
+            # Check each hostname for match quality
+            for h in hostnames:
+                sld = h.split(".")[-2] if len(h.split(".")) >= 2 else h
+                # Exact SLD match is the strongest signal
+                if keyword == sld:
+                    score += 3
+                else:
+                    # Subdomain or partial match
+                    score += 1
+            # Longer keywords are more specific and deserve a bonus
+            if len(keyword) >= 6:
+                score += 1
+            if brand in brand_scores:
+                brand_scores[brand] = max(brand_scores[brand], score)
+            else:
+                brand_scores[brand] = score
 
-    return None
+    if not brand_scores:
+        return None
+
+    # Return the brand with the highest score.
+    return max(brand_scores, key=brand_scores.get)
 
 
 def _generate_campaign_name(brand: str) -> str:
@@ -198,6 +225,74 @@ def _generate_campaign_name(brand: str) -> str:
 # ---------------------------------------------------------------------------
 # Campaign detection
 # ---------------------------------------------------------------------------
+
+
+def _count_shared_iocs(campaign, cluster, session) -> int:
+    """Count IOCs shared between a campaign and a cluster using value-based comparison.
+
+    Compares (ioc_type, ioc_value) tuples rather than database IDs to avoid
+    false non-matches when the same IOC is stored under different rows.
+
+    Args:
+        campaign: CampaignModel instance.
+        cluster: ClusterModel instance.
+        session: SQLAlchemy session.
+
+    Returns:
+        Number of shared (type, value) IOC pairs.
+    """
+    from database import (  # type: ignore[import-untyped]
+        CampaignClusterModel,
+        ClusterMemberModel,
+        ClusterModel,
+        IocModel,
+        IocOccurrenceModel,
+        SnapshotModel,
+    )
+
+    def _load_ioc_set(entity_type: str, entity_id) -> set[tuple[str, str]]:
+        """Load IOC (type, value) tuples for a campaign or cluster."""
+        if entity_type == "campaign":
+            # Get all domain IDs from all clusters linked to the campaign.
+            domain_ids_q = (
+                session.query(ClusterMemberModel.domain_id)
+                .join(ClusterModel, ClusterMemberModel.cluster_id == ClusterModel.id)
+                .join(CampaignClusterModel, CampaignClusterModel.cluster_id == ClusterModel.id)
+                .filter(CampaignClusterModel.campaign_id == entity_id)
+            ).all()
+            domain_ids = {row[0] for row in domain_ids_q}
+        else:
+            # Get domain IDs from cluster members.
+            domain_ids_q = (
+                session.query(ClusterMemberModel.domain_id)
+                .filter(ClusterMemberModel.cluster_id == entity_id)
+            ).all()
+            domain_ids = {row[0] for row in domain_ids_q}
+
+        if not domain_ids:
+            return set()
+
+        # Get snapshot IDs for these domains.
+        snapshot_ids_q = (
+            session.query(SnapshotModel.id)
+            .filter(SnapshotModel.domain_id.in_(domain_ids))
+        ).all()
+        snapshot_ids = {row[0] for row in snapshot_ids_q}
+
+        if not snapshot_ids:
+            return set()
+
+        # Get IOC (type, value) tuples from occurrences.
+        rows = (
+            session.query(IocModel.type, IocModel.value)
+            .join(IocOccurrenceModel, IocOccurrenceModel.ioc_id == IocModel.id)
+            .filter(IocOccurrenceModel.snapshot_id.in_(snapshot_ids))
+        ).all()
+        return {(row[0], row[1]) for row in rows}
+
+    campaign_iocs = _load_ioc_set("campaign", campaign.id)
+    cluster_iocs = _load_ioc_set("cluster", cluster.id)
+    return len(campaign_iocs & cluster_iocs)
 
 
 def _recompute_domain_count(campaign, session) -> int:
@@ -300,11 +395,17 @@ def detect_campaigns(session) -> dict:
                 continue
 
             _recompute_domain_count(campaign, session)
-            campaign.last_seen = cluster.last_seen
+            campaign.last_seen = max(campaign.last_seen or cluster.last_seen, cluster.last_seen)
 
-            # Determine dormancy or re-activation.
+            # Determine dormancy or re-activation (C-4: campaign-wide check).
             dormant_cutoff = datetime.now(timezone.utc) - timedelta(days=DORMANT_THRESHOLD_DAYS)
-            if cluster.last_seen < dormant_cutoff and campaign.status == "active":
+            max_last_seen = (
+                session.query(func.max(ClusterModel.last_seen))
+                .join(CampaignClusterModel, CampaignClusterModel.cluster_id == ClusterModel.id)
+                .filter(CampaignClusterModel.campaign_id == campaign.id)
+                .scalar()
+            )
+            if max_last_seen and max_last_seen < dormant_cutoff and campaign.status == "active":
                 campaign.status = "dormant"
                 logger.info(
                     "Campaign %s (%s) marked dormant — no new domains since %s",
@@ -351,39 +452,72 @@ def detect_campaigns(session) -> dict:
             )
 
             if existing_brand_campaign is not None:
-                # Link this cluster to the existing campaign instead of creating a new one.
-                try:
-                    with session.begin_nested():
-                        link = CampaignClusterModel(
-                            campaign_id=existing_brand_campaign.id,
-                            cluster_id=cluster.id,
+                # C-2: Require similarity signal beyond brand match before merging.
+                cluster_sig = cluster.signature_hash
+                campaign_sig = existing_brand_campaign.kit_signature
+                should_merge = False
+
+                if cluster_sig and campaign_sig:
+                    if cluster_sig == campaign_sig:
+                        # Both have signatures and they match — merge.
+                        should_merge = True
+                    else:
+                        # Signatures explicitly mismatch — separate campaigns.
+                        logger.info(
+                            "Kit signature mismatch for cluster %s vs campaign %s (brand=%s) — creating separate campaign",
+                            cluster.id[:8], existing_brand_campaign.id[:8], brand,
                         )
-                        session.add(link)
-                        session.flush()
-                except Exception:
+                else:
+                    # At least one side lacks a signature — require IOC overlap.
+                    shared_count = _count_shared_iocs(existing_brand_campaign, cluster, session)
+                    if shared_count >= 3:
+                        should_merge = True
+                    else:
+                        logger.info(
+                            "Insufficient IOC overlap (%d) for brand-only match — cluster %s vs campaign %s (brand=%s)",
+                            shared_count, cluster.id[:8], existing_brand_campaign.id[:8], brand,
+                        )
+
+                if should_merge:
+                    # Link this cluster to the existing campaign.
+                    try:
+                        with session.begin_nested():
+                            link = CampaignClusterModel(
+                                campaign_id=existing_brand_campaign.id,
+                                cluster_id=cluster.id,
+                            )
+                            session.add(link)
+                            session.flush()
+                    except Exception:
+                        logger.debug(
+                            "Cluster %s already linked to campaign %s",
+                            cluster.id[:8], existing_brand_campaign.id[:8],
+                        )
+                    _recompute_domain_count(existing_brand_campaign, session)
+                    existing_brand_campaign.last_seen = max(
+                        existing_brand_campaign.last_seen or datetime.now(timezone.utc),
+                        cluster.last_seen or datetime.now(timezone.utc),
+                    )
+                    # F-4: Update first_seen to earliest value.
+                    existing_brand_campaign.first_seen = min(
+                        existing_brand_campaign.first_seen or cluster.first_seen,
+                        cluster.first_seen,
+                    )
+                    # Re-activate if dormant
+                    if existing_brand_campaign.status == "dormant":
+                        existing_brand_campaign.status = "active"
+                        logger.info(
+                            "Re-activated campaign %s (%s) for brand %s with new cluster",
+                            existing_brand_campaign.id[:8], existing_brand_campaign.name, brand,
+                        )
+                    campaigns_updated += 1
                     logger.debug(
-                        "Cluster %s already linked to campaign %s",
-                        cluster.id[:8], existing_brand_campaign.id[:8],
+                        "Linked cluster %s to existing campaign %s (brand=%s)",
+                        cluster.id[:8], existing_brand_campaign.id[:8], brand,
                     )
-                _recompute_domain_count(existing_brand_campaign, session)
-                existing_brand_campaign.last_seen = max(
-                    existing_brand_campaign.last_seen or datetime.now(timezone.utc),
-                    cluster.last_seen or datetime.now(timezone.utc),
-                )
-                # Re-activate if dormant
-                if existing_brand_campaign.status == "dormant":
-                    existing_brand_campaign.status = "active"
-                    logger.info(
-                        "Re-activated campaign %s (%s) for brand %s with new cluster",
-                        existing_brand_campaign.id[:8], existing_brand_campaign.name, brand,
-                    )
-                campaigns_updated += 1
-                logger.debug(
-                    "Linked cluster %s to existing campaign %s (brand=%s)",
-                    cluster.id[:8], existing_brand_campaign.id[:8], brand,
-                )
-                cluster.last_campaign_check = datetime.now(timezone.utc)
-                continue
+                    cluster.last_campaign_check = datetime.now(timezone.utc)
+                    continue
+                # Not merging — fall through to create a new campaign.
 
             campaign_name = _generate_campaign_name(brand)
             campaign_id = str(uuid.uuid4())

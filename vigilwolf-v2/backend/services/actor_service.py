@@ -216,6 +216,152 @@ def _build_fingerprint_fast(
 
 
 # ---------------------------------------------------------------------------
+# Union-find helpers for C-6 transitive closure
+# ---------------------------------------------------------------------------
+
+
+class _UnionFind:
+    """Simple union-find (disjoint-set) with path compression and union by size."""
+
+    def __init__(self):
+        self._parent: dict[str, str] = {}
+        self._size: dict[str, int] = {}
+
+    def find(self, x: str) -> str:
+        if x not in self._parent:
+            self._parent[x] = x
+            self._size[x] = 1
+        if self._parent[x] != x:
+            self._parent[x] = self.find(self._parent[x])  # path compression
+        return self._parent[x]
+
+    def union(self, x: str, y: str) -> None:
+        rx, ry = self.find(x), self.find(y)
+        if rx == ry:
+            return
+        # Union by size — attach smaller tree under larger.
+        if self._size[rx] < self._size[ry]:
+            rx, ry = ry, rx
+        self._parent[ry] = rx
+        self._size[rx] += self._size[ry]
+
+    def components(self) -> dict[str, set[str]]:
+        """Return {root: set(members)} for all connected components."""
+        groups: dict[str, set[str]] = {}
+        for node in self._parent:
+            root = self.find(node)
+            groups.setdefault(root, set()).add(node)
+        return groups
+
+
+def _merge_transitive_actors(session, actor_link_map: dict, all_actors: dict) -> None:
+    """C-6: Merge actors that are transitively connected via shared campaigns.
+
+    If actor X links campaigns A and B, and actor Y links campaigns B and C,
+    then A-B-C are transitively connected and X/Y should be a single actor.
+    Uses union-find on campaign IDs to find connected components, then merges
+    all actors within each component into a single survivor (highest confidence).
+    """
+    from database import (  # type: ignore[import-untyped]
+        ActorCampaignModel,
+        ActorModel,
+    )
+
+    # 1. Build a graph of campaign connections via actors.
+    #    For each actor, all campaigns it links form a clique.
+    uf = _UnionFind()
+    for _actor_id, camp_ids in actor_link_map.items():
+        for i in range(len(camp_ids)):
+            for j in range(i + 1, len(camp_ids)):
+                uf.union(camp_ids[i], camp_ids[j])
+
+    # 2. Group actors by the connected component of their campaigns.
+    actor_by_component: dict[str, list[str]] = {}  # root campaign -> [actor_ids]
+    for actor_id, camp_ids in actor_link_map.items():
+        if not camp_ids:
+            continue
+        root = uf.find(camp_ids[0])
+        actor_by_component.setdefault(root, []).append(actor_id)
+
+    # 3. For each component with multiple actors, merge into a survivor.
+    for root, actor_ids in actor_by_component.items():
+        if len(actor_ids) < 2:
+            continue
+
+        # Pick survivor: highest confidence_score.
+        candidates = [
+            (aid, all_actors[aid].confidence_score)
+            for aid in actor_ids
+            if aid in all_actors
+        ]
+        if len(candidates) < 2:
+            continue
+
+        candidates.sort(key=lambda t: t[1], reverse=True)
+        survivor_id = candidates[0][0]
+
+        # Move all ActorCampaignModel links from non-survivors to survivor.
+        for loser_id, _score in candidates[1:]:
+            loser_links = (
+                session.query(ActorCampaignModel)
+                .filter(ActorCampaignModel.actor_id == loser_id)
+                .all()
+            )
+            for link in loser_links:
+                # Check if this campaign is already linked to the survivor.
+                already_linked = (
+                    session.query(ActorCampaignModel)
+                    .filter(
+                        ActorCampaignModel.actor_id == survivor_id,
+                        ActorCampaignModel.campaign_id == link.campaign_id,
+                    )
+                    .first()
+                )
+                if already_linked is None:
+                    session.add(ActorCampaignModel(
+                        actor_id=survivor_id,
+                        campaign_id=link.campaign_id,
+                    ))
+                session.delete(link)
+
+            # Delete the loser actor.
+            loser_actor = session.query(ActorModel).get(loser_id)
+            if loser_actor is not None:
+                logger.info(
+                    "C-6: Merging actor %s (%s, conf=%.3f) into survivor %s (%s, conf=%.3f)",
+                    loser_id[:8], loser_actor.label, loser_actor.confidence_score,
+                    survivor_id[:8],
+                    all_actors[survivor_id].label if survivor_id in all_actors else "?",
+                    all_actors[survivor_id].confidence_score if survivor_id in all_actors else 0,
+                )
+                session.delete(loser_actor)
+
+            # Update in-memory maps.
+            if loser_id in all_actors:
+                del all_actors[loser_id]
+            if loser_id in actor_link_map:
+                del actor_link_map[loser_id]
+
+        # Update survivor's in-memory campaign list.
+        survivor_links = (
+            session.query(ActorCampaignModel)
+            .filter(ActorCampaignModel.actor_id == survivor_id)
+            .all()
+        )
+        survivor_camp_ids = [link.campaign_id for link in survivor_links]
+        actor_link_map[survivor_id] = survivor_camp_ids
+        if survivor_id in all_actors:
+            survivor_actor = all_actors[survivor_id]
+            survivor_actor.meta = {
+                **(survivor_actor.meta or {}),
+                "campaign_ids": sorted(survivor_camp_ids),
+                "transitive_merge": True,
+            }
+
+    session.flush()
+
+
+# ---------------------------------------------------------------------------
 # Core service functions
 # ---------------------------------------------------------------------------
 
@@ -332,28 +478,33 @@ def profile_actors(session) -> dict:
     for sids in domain_snapshot_map.values():
         relevant_snapshot_ids.update(sids)
 
-    # Pre-load snapshot -> IOC mappings (filtered to relevant snapshots only)
-    snapshot_ioc_map: dict[str, set[int]] = {}
+    # H-7 fix: Pre-load snapshot -> IOC (type, value) mappings using value-based
+    # keys instead of database IDs, so Jaccard similarity compares IOC content
+    # rather than relying on fragile row identity.
+    snapshot_ioc_map: dict[str, set[tuple[str, str]]] = {}
     if relevant_snapshot_ids:
-        filtered_occurrences = session.query(IocOccurrenceModel).filter(
-            IocOccurrenceModel.snapshot_id.in_(relevant_snapshot_ids)
-        ).all()
-        for occ in filtered_occurrences:
-            snapshot_ioc_map.setdefault(occ.snapshot_id, set()).add(occ.ioc_id)
+        filtered_ioc_rows = (
+            session.query(IocOccurrenceModel.snapshot_id, IocModel.type, IocModel.value)
+            .join(IocModel, IocOccurrenceModel.ioc_id == IocModel.id)
+            .filter(IocOccurrenceModel.snapshot_id.in_(relevant_snapshot_ids))
+            .all()
+        )
+        for row in filtered_ioc_rows:
+            snapshot_ioc_map.setdefault(row.snapshot_id, set()).add((row.type, row.value))
 
-    # Pre-compute campaign -> IOC IDs mapping
-    campaign_ioc_map: dict[str, set[int]] = {}
+    # Pre-compute campaign -> IOC (type, value) mapping
+    campaign_ioc_map: dict[str, set[tuple[str, str]]] = {}
     for camp in campaigns:
         camp_clusters = campaign_cluster_map.get(camp.id, set())
         domain_ids: set[str] = set()
         for cid in camp_clusters:
             domain_ids.update(cluster_domain_map.get(cid, set()))
 
-        ioc_ids: set[int] = set()
+        ioc_tuples: set[tuple[str, str]] = set()
         for did in domain_ids:
             for sid in domain_snapshot_map.get(did, set()):
-                ioc_ids.update(snapshot_ioc_map.get(sid, set()))
-        campaign_ioc_map[camp.id] = ioc_ids
+                ioc_tuples.update(snapshot_ioc_map.get(sid, set()))
+        campaign_ioc_map[camp.id] = ioc_tuples
 
     # Pre-load domain attributes for fingerprint building
     domain_registrar_map: dict[str, str | None] = {}
@@ -395,9 +546,12 @@ def profile_actors(session) -> dict:
         for row in exfil_rows:
             exfil_ioc_map.setdefault(row.domain_id, []).append(row.value)
 
-    # Pre-load ALL existing actor-campaign mappings to avoid per-pair queries
+    # Pre-load actor-campaign mappings scoped to active campaigns only
     actor_campaign_pairs: dict[frozenset[str], str] = {}  # {camp_id_a, camp_id_b} -> actor_id
-    all_actor_links = session.query(ActorCampaignModel).all()
+    all_actor_links = session.query(ActorCampaignModel).filter(
+        ActorCampaignModel.campaign_id.in_(campaign_ids)
+    ).all()
+    actor_ids = {link.actor_id for link in all_actor_links}
     actor_link_map: dict[str, list[str]] = {}  # actor_id -> [campaign_ids]
     for link in all_actor_links:
         actor_link_map.setdefault(link.actor_id, []).append(link.campaign_id)
@@ -408,8 +562,10 @@ def profile_actors(session) -> dict:
                 pair_key = frozenset([camp_ids[i], camp_ids[j]])
                 actor_campaign_pairs[pair_key] = actor_id
 
-    # Pre-load all actors for updates
-    all_actors = {a.id: a for a in session.query(ActorModel).all()}
+    # Pre-load only actors linked to active campaigns
+    all_actors = {a.id: a for a in session.query(ActorModel).filter(
+        ActorModel.id.in_(actor_ids)
+    ).all()} if actor_ids else {}
 
     actors_created = 0
     actors_updated = 0
@@ -481,6 +637,18 @@ def profile_actors(session) -> dict:
                 "last_profiled": now.isoformat(),
                 "campaign_ids": sorted(actor_link_map.get(existing_actor_id, [])),
             }
+            # F-5: Log degradation warning when confidence drops below threshold.
+            if existing_actor.confidence_score < CONFIDENCE_THRESHOLD:
+                logger.warning(
+                    "Actor %s (%s) confidence %.3f dropped below threshold %.1f — low-confidence degradation",
+                    existing_actor.id[:8], existing_actor.label,
+                    existing_actor.confidence_score, CONFIDENCE_THRESHOLD,
+                )
+                existing_actor.meta = {
+                    **(existing_actor.meta or {}),
+                    "degraded": True,
+                    "degraded_at": now.isoformat(),
+                }
             actors_updated += 1
             logger.debug(
                 "Updated actor %s (%s) confidence=%.3f",
@@ -526,42 +694,99 @@ def profile_actors(session) -> dict:
                     actor.id[:8], label, confidence, camp_a.id[:8], camp_b.id[:8],
                 )
             except IntegrityError:
-                # H-5 fix: Duplicate label — recover by linking campaigns to existing actor.
-                logger.debug(
-                    "Duplicate actor label '%s' for campaign pair %s/%s — recovering",
-                    label, camp_a.id[:8], camp_b.id[:8],
+                # C-5 fix: Use composite campaign-ID dedup instead of label-based.
+                # Check if an ActorCampaignModel already links both campaigns.
+                session.rollback()
+                existing_link = (
+                    session.query(ActorCampaignModel)
+                    .filter(ActorCampaignModel.campaign_id == camp_a.id)
+                    .first()
                 )
-                existing_actor = session.query(ActorModel).filter(
-                    ActorModel.label == label
-                ).first()
-                if existing_actor is not None:
-                    existing_actor.last_seen = now
-                    existing_camp_ids = set(actor_link_map.get(existing_actor.id, []))
-                    new_camp_ids = set()
-                    for camp_id in (camp_a.id, camp_b.id):
-                        if camp_id not in existing_camp_ids:
+                # Find an actor that links both campaign IDs.
+                linked_actor_id = None
+                if existing_link is not None:
+                    # Check all actors linked to camp_a to see if any also link camp_b.
+                    a_links = session.query(ActorCampaignModel).filter(
+                        ActorCampaignModel.campaign_id == camp_a.id,
+                    ).all()
+                    for al in a_links:
+                        b_link = session.query(ActorCampaignModel).filter(
+                            ActorCampaignModel.actor_id == al.actor_id,
+                            ActorCampaignModel.campaign_id == camp_b.id,
+                        ).first()
+                        if b_link is not None:
+                            linked_actor_id = al.actor_id
+                            break
+
+                if linked_actor_id is not None:
+                    # Pair already linked — just update confidence.
+                    logger.debug(
+                        "Campaign pair %s/%s already linked by actor %s — updating",
+                        camp_a.id[:8], camp_b.id[:8], linked_actor_id[:8],
+                    )
+                    if linked_actor_id in all_actors:
+                        existing_actor = all_actors[linked_actor_id]
+                        existing_actor.confidence_score = confidence
+                        existing_actor.fingerprint = fingerprint
+                        existing_actor.label = label
+                        existing_actor.last_seen = now
+                        existing_actor.meta = {
+                            **(existing_actor.meta or {}),
+                            "last_profiled": now.isoformat(),
+                        }
+                        actors_updated += 1
+                else:
+                    # No existing link — create a new actor with a unique label.
+                    unique_label = f"{label}_{uuid.uuid4().hex[:6]}"
+                    logger.info(
+                        "Label conflict for campaign pair %s/%s — creating actor with unique label %s",
+                        camp_a.id[:8], camp_b.id[:8], unique_label,
+                    )
+                    actor_id = str(uuid.uuid4())
+                    try:
+                        with session.begin_nested():
+                            actor = ActorModel(
+                                id=actor_id,
+                                label=unique_label,
+                                fingerprint=fingerprint,
+                                confidence_score=confidence,
+                                first_seen=now,
+                                last_seen=now,
+                                meta={
+                                    "last_profiled": now.isoformat(),
+                                    "campaign_ids": [camp_a.id, camp_b.id],
+                                    "label_conflict_resolution": True,
+                                },
+                            )
+                            session.add(actor)
+                            session.flush()
+
                             session.add(ActorCampaignModel(
-                                actor_id=existing_actor.id,
-                                campaign_id=camp_id,
+                                actor_id=actor.id,
+                                campaign_id=camp_a.id,
                             ))
-                            new_camp_ids.add(camp_id)
-                    # Update in-memory maps for subsequent pairs
-                    all_camp_ids = existing_camp_ids | new_camp_ids
-                    actor_link_map[existing_actor.id] = list(all_camp_ids)
-                    all_actors[existing_actor.id] = existing_actor
-                    # Rebuild actor_campaign_pairs for this actor
-                    camp_ids_list = list(all_camp_ids)
-                    for i in range(len(camp_ids_list)):
-                        for j in range(i + 1, len(camp_ids_list)):
-                            actor_campaign_pairs[frozenset([camp_ids_list[i], camp_ids_list[j]])] = existing_actor.id
-                    existing_actor.meta = {
-                        **(existing_actor.meta or {}),
-                        "last_profiled": now.isoformat(),
-                        "campaign_ids": sorted(all_camp_ids),
-                    }
-                    actors_updated += 1
+                            session.add(ActorCampaignModel(
+                                actor_id=actor.id,
+                                campaign_id=camp_b.id,
+                            ))
+                        actors_created += 1
+                        all_actors[actor.id] = actor
+                        actor_link_map[actor.id] = [camp_a.id, camp_b.id]
+                        actor_campaign_pairs[frozenset([camp_a.id, camp_b.id])] = actor.id
+                    except Exception:
+                        logger.debug(
+                            "Failed to create actor for campaign pair %s/%s after label conflict",
+                            camp_a.id[:8], camp_b.id[:8],
+                        )
 
     session.flush()
+
+    # C-6: Union-find transitive closure — merge actors that are linked to
+    # campaigns in the same connected component.  If campaigns A-B share an
+    # actor and B-C share another actor, all three campaigns should belong to
+    # one actor (the survivor).
+    _merge_transitive_actors(session, actor_link_map, all_actors)
+
     logger.info(
         "profile_actors complete: %d actors created, %d actors updated",
         actors_created, actors_updated,
