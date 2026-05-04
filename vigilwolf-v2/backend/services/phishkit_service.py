@@ -16,10 +16,20 @@ import uuid
 from collections import defaultdict
 from datetime import datetime, timezone, timedelta
 from typing import Optional
+from urllib.parse import urlparse
 
 logger = logging.getLogger(__name__)
 
 PHISHKIT_WINDOW_DAYS = 30
+
+# Benign shared-infrastructure domains that should never be set as exfil_endpoint.
+_PHISHKIT_BENIGN_DOMAIN_DENYLIST = frozenset({
+    "google-analytics.com", "googletagmanager.com", "doubleclick.net",
+    "facebook.com", "hotjar.com", "mixpanel.com", "segment.com",
+    "cloudflare.com", "cdn.jsdelivr.net", "ajax.googleapis.com",
+    "stripe.com", "paypal.com", "js.stripe.com",
+    "recaptcha.net", "www.google.com", "www.googletagmanager.com",
+})
 
 
 # ---------------------------------------------------------------------------
@@ -202,11 +212,25 @@ def detect_phishkits(session) -> dict:
 # ---------------------------------------------------------------------------
 
 
+def _is_benign_domain(url_or_hostname: str) -> bool:
+    """Check if a URL or hostname belongs to a benign shared-infrastructure domain.
+
+    Returns True if the hostname matches or is a subdomain of a known benign domain.
+    """
+    # Try parsing as a URL first; fall back to treating the string as a hostname.
+    hostname = urlparse(url_or_hostname).hostname
+    if not hostname:
+        hostname = url_or_hostname
+    hostname = hostname.lower()
+    return any(hostname == d or hostname.endswith(f".{d}") for d in _PHISHKIT_BENIGN_DOMAIN_DENYLIST)
+
+
 def _enrich_exfil_endpoint(phishkit, snapshot_ids: list[str], session) -> None:
     """Look for exfiltration endpoint IOCs in ioc_extractor results.
 
     Scans ioc_extractor analysis results for the given snapshots and sets
     phishkit.exfil_endpoint to the first URL IOC whose role is exfil_endpoint.
+    Benign shared-infrastructure domains are skipped to avoid false enrichment.
     """
     from database import (  # type: ignore[import-untyped]
         AnalysisResultModel,
@@ -240,6 +264,13 @@ def _enrich_exfil_endpoint(phishkit, snapshot_ids: list[str], session) -> None:
         if exfil_occ is not None:
             ioc = session.query(IocModel).get(exfil_occ.ioc_id)
             if ioc is not None:
+                # Skip benign shared-infrastructure domains.
+                if _is_benign_domain(ioc.value):
+                    logger.debug(
+                        "Skipping benign exfil_endpoint=%s for phishkit %s (snapshot %s)",
+                        ioc.value, phishkit.id, sid,
+                    )
+                    continue
                 phishkit.exfil_endpoint = ioc.value
                 logger.debug(
                     "Enriched phishkit %s exfil_endpoint=%s from snapshot %s",
@@ -252,7 +283,14 @@ def _enrich_exfil_endpoint(phishkit, snapshot_ids: list[str], session) -> None:
         urls = findings.get("urls", [])
         for url in urls:
             url_lower = url.lower()
-            if any(sig in url_lower for sig in ("post", "submit", "login", "api/login", "api/submit")):
+            if any(sig in url_lower for sig in ("submit", "login", "api/login", "api/submit")):
+                # Skip benign shared-infrastructure domains.
+                if _is_benign_domain(url):
+                    logger.debug(
+                        "Skipping benign heuristic exfil_endpoint=%s for phishkit %s (snapshot %s)",
+                        url, phishkit.id, sid,
+                    )
+                    continue
                 phishkit.exfil_endpoint = url
                 logger.debug(
                     "Enriched phishkit %s exfil_endpoint=%s (heuristic) from snapshot %s",

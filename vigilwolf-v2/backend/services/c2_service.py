@@ -9,6 +9,7 @@ from __future__ import annotations
 import logging
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
+from urllib.parse import urlparse
 
 logger = logging.getLogger(__name__)
 
@@ -20,9 +21,18 @@ SCORE_MULTI_DOMAIN = 0.2
 SCORE_LINKED_PHISHKIT = 0.2
 SCORE_RECEIVES_POST = 0.2
 
+# Benign shared-infrastructure domains that should not be scored as C2.
+_C2_BENIGN_DOMAIN_DENYLIST = frozenset({
+    "google-analytics.com", "googletagmanager.com", "doubleclick.net",
+    "facebook.com", "hotjar.com", "mixpanel.com", "segment.com",
+    "cloudflare.com", "cdn.jsdelivr.net", "ajax.googleapis.com",
+    "stripe.com", "paypal.com", "js.stripe.com",
+    "recaptcha.net", "www.google.com", "www.googletagmanager.com",
+})
+
 # Multi-domain threshold: IOC appears in snapshots across this many distinct
 # domains before it qualifies for the multi-domain signal.
-MULTI_DOMAIN_THRESHOLD = 5
+MULTI_DOMAIN_THRESHOLD = 20
 
 # Maximum number of candidates to return.
 MAX_CANDIDATES = 50
@@ -50,8 +60,8 @@ def _is_post_form_target(ioc_value: str, ioc_type: str) -> bool:
         return False
     lower = ioc_value.lower()
     indicators = (
-        "post", "submit", "login", "form", "upload", "send",
-        "api/login", "api/submit", "capture", "collect", "exfil",
+        "submit", "login", "form", "upload",
+        "api/login", "api/submit", "capture", "exfil",
     )
     return any(sig in lower for sig in indicators)
 
@@ -226,6 +236,12 @@ def rank_c2_candidates(session, snapshot_id: str | None = None) -> list[dict]:
         if ioc_roles.get(ioc.id) == "exfil_endpoint":
             score += SCORE_RECEIVES_POST
             signals.append("receives_post_data")
+
+        # Filter out benign shared infrastructure domains
+        hostname = (urlparse(ioc.value).hostname or "").lower() if ioc.type == "url" else ""
+        if hostname and any(hostname == d or hostname.endswith(f".{d}") for d in _C2_BENIGN_DOMAIN_DENYLIST):
+            score *= 0.1  # Severe penalty for known benign domains
+            signals.append("benign_domain")
 
         # Only include IOCs with at least one signal.
         if score > 0.0:

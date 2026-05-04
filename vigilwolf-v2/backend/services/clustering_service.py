@@ -17,6 +17,22 @@ logger = logging.getLogger(__name__)
 
 CLUSTERING_WINDOW_DAYS = 30
 
+# Common ASNs that host massive shared infrastructure and should not be used
+# for infra clustering (they create false mega-clusters).
+_COMMON_ASN_DENYLIST = frozenset({
+    "AS13335",  # Cloudflare
+    "AS20940",  # Akamai
+    "AS16509",  # AWS
+    "AS14618",  # AWS
+    "AS15169",  # Google
+    "AS8075",   # Microsoft
+    "AS13414",  # Twitter
+})
+
+# Maximum number of domains in a single cluster — larger groups are skipped
+# to prevent false mega-clusters from shared infrastructure.
+MAX_CLUSTER_SIZE = 500
+
 
 # ---------------------------------------------------------------------------
 # Structural-hash clustering
@@ -62,7 +78,7 @@ def cluster_by_structural_hash(session) -> dict:
     )
 
     # Group domain_ids by structural_hash.
-    hash_groups: dict[str, list[str]] = defaultdict(list)
+    hash_groups: dict[str, set[str]] = defaultdict(set)
     for result in results:
         findings = result.result_json or {}
         structural_hash = findings.get("structural_hash")
@@ -75,9 +91,8 @@ def cluster_by_structural_hash(session) -> dict:
             continue
         domain_id = snapshot.domain_id
 
-        # Avoid duplicate domain entries within the same hash group.
-        if domain_id not in hash_groups[structural_hash]:
-            hash_groups[structural_hash].append(domain_id)
+        # Deduplication is automatic with sets.
+        hash_groups[structural_hash].add(domain_id)
 
     clusters_created = 0
     domains_clustered = 0
@@ -185,48 +200,48 @@ def cluster_by_structural_hash(session) -> dict:
 # Infrastructure clustering
 # ---------------------------------------------------------------------------
 
-def _build_infra_signature(domain_id: str, session) -> Optional[str]:
+def _build_infra_signature(domain_id: str, domain_map: dict, ip_map: dict, ns_map: dict) -> Optional[str]:
     """Build an infrastructure signature tuple for a domain.
 
     The signature is (asn, registrar, first NS record).  Returns None if
     the domain has no IP records (cannot determine ASN).
-    """
-    from database import (  # type: ignore[import-untyped]
-        DomainIpModel,
-        DnsRecordModel,
-        DomainModel,
-    )
 
-    domain = session.query(DomainModel).get(domain_id)
+    Uses pre-loaded domain_map, ip_map, and ns_map instead of per-domain
+    DB queries for bulk efficiency.
+    """
+    domain = domain_map.get(domain_id)
     if domain is None:
         return None
 
-    # ASN: take from the first IP record that has one.
+    # ASN: take from the first IP record (by first_seen) that has one.
     asn = None
-    ip_record = (
-        session.query(DomainIpModel)
-        .filter(DomainIpModel.domain_id == domain_id)
-        .order_by(DomainIpModel.first_seen)
-        .first()
-    )
-    if ip_record and hasattr(ip_record, "asn") and ip_record.asn:
-        asn = str(ip_record.asn)
+    domain_ips = ip_map.get(domain_id, [])
+    if domain_ips:
+        sorted_ips = sorted(
+            domain_ips,
+            key=lambda ip: ip.first_seen or datetime.min.replace(tzinfo=timezone.utc),
+        )
+        for ip_record in sorted_ips:
+            if hasattr(ip_record, "asn") and ip_record.asn:
+                asn = str(ip_record.asn)
+                # Null out common ASNs that create false mega-clusters.
+                if asn in _COMMON_ASN_DENYLIST:
+                    asn = None
+                break
 
     # Registrar: stored on DomainProcessingState or domain meta.
     # Fallback: check if DomainModel has registrar attribute.
     registrar = getattr(domain, "registrar", None)
 
-    # First NS record.
-    ns_record = (
-        session.query(DnsRecordModel)
-        .filter(
-            DnsRecordModel.domain_id == domain_id,
-            DnsRecordModel.type == "NS",
+    # First NS record (by first_seen).
+    first_ns = None
+    domain_ns = ns_map.get(domain_id, [])
+    if domain_ns:
+        sorted_ns = sorted(
+            domain_ns,
+            key=lambda ns: ns.first_seen or datetime.min.replace(tzinfo=timezone.utc),
         )
-        .order_by(DnsRecordModel.first_seen)
-        .first()
-    )
-    first_ns = ns_record.value if ns_record else None
+        first_ns = sorted_ns[0].value
 
     # Build signature. Require at least 2 of 3 signal fields to avoid grouping
     # unrelated domains that happen to share a blank field.
@@ -267,6 +282,8 @@ def cluster_by_infrastructure(session) -> dict:
     from database import (  # type: ignore[import-untyped]
         ClusterMemberModel,
         ClusterModel,
+        DnsRecordModel,
+        DomainIpModel,
         DomainModel,
         SnapshotModel,
     )
@@ -281,20 +298,43 @@ def cluster_by_infrastructure(session) -> dict:
         .all()
     }
 
-    domains = session.query(DomainModel).filter(DomainModel.id.in_(recent_domain_ids)).all()
+    # Bulk-preload domain data for infra signatures (S-2)
+    domain_map: dict = {d.id: d for d in session.query(DomainModel).filter(
+        DomainModel.id.in_(recent_domain_ids)
+    ).all()} if recent_domain_ids else {}
+    ip_map: dict[str, list] = defaultdict(list)
+    for ip in session.query(DomainIpModel).filter(
+        DomainIpModel.domain_id.in_(recent_domain_ids)
+    ).all() if recent_domain_ids else []:
+        ip_map[ip.domain_id].append(ip)
+    ns_map: dict[str, list] = defaultdict(list)
+    for ns in session.query(DnsRecordModel).filter(
+        DnsRecordModel.domain_id.in_(recent_domain_ids),
+        DnsRecordModel.type == "NS",
+    ).all() if recent_domain_ids else []:
+        ns_map[ns.domain_id].append(ns)
+
     sig_groups: dict[str, list[str]] = defaultdict(list)
 
-    for domain in domains:
-        sig = _build_infra_signature(domain.id, session)
+    for domain_id in domain_map:
+        sig = _build_infra_signature(domain_id, domain_map, ip_map, ns_map)
         if sig is None:
             continue
-        sig_groups[sig].append(domain.id)
+        sig_groups[sig].append(domain_id)
 
     clusters_created = 0
     domains_clustered = 0
 
     for sig, domain_ids in sig_groups.items():
         if len(domain_ids) < 3:
+            continue
+
+        # Skip mega-clusters from shared infrastructure.
+        if len(domain_ids) > MAX_CLUSTER_SIZE:
+            logger.debug(
+                "Skipping infra cluster with %d domains (exceeds MAX_CLUSTER_SIZE=%d): sig=%s",
+                len(domain_ids), MAX_CLUSTER_SIZE, sig[:40],
+            )
             continue
 
         # Derive a stable hash from the signature string.
@@ -393,6 +433,59 @@ def cluster_by_infrastructure(session) -> dict:
         clusters_created, domains_clustered,
     )
     return {"clusters_created": clusters_created, "domains_clustered": domains_clustered}
+
+
+# ---------------------------------------------------------------------------
+# Reconciliation
+# ---------------------------------------------------------------------------
+
+
+def reconcile_cluster_domain_counts(session) -> dict:
+    """Reconcile ClusterModel.domain_count with actual ClusterMemberModel rows.
+
+    For each cluster, count the actual number of ClusterMemberModel rows and
+    update ClusterModel.domain_count if it doesn't match.  This corrects drift
+    caused by race conditions or failed transactions during clustering.
+
+    Args:
+        session: SQLAlchemy session (caller is responsible for commit).
+
+    Returns:
+        Dict with clusters_checked and clusters_updated counts.
+    """
+    from database import (  # type: ignore[import-untyped]
+        ClusterMemberModel,
+        ClusterModel,
+    )
+    from sqlalchemy import func
+
+    clusters = session.query(ClusterModel).all()
+
+    clusters_checked = 0
+    clusters_updated = 0
+
+    for cluster in clusters:
+        clusters_checked += 1
+        actual_count = (
+            session.query(func.count(ClusterMemberModel.id))
+            .filter(ClusterMemberModel.cluster_id == cluster.id)
+            .scalar()
+        ) or 0
+
+        if cluster.domain_count != actual_count:
+            logger.info(
+                "Reconciling cluster %s: domain_count %d -> %d",
+                cluster.id[:8], cluster.domain_count, actual_count,
+            )
+            cluster.domain_count = actual_count
+            clusters_updated += 1
+
+    session.flush()
+    logger.info(
+        "Cluster domain_count reconciliation: %d checked, %d updated",
+        clusters_checked, clusters_updated,
+    )
+    return {"clusters_checked": clusters_checked, "clusters_updated": clusters_updated}
 
 
 # ---------------------------------------------------------------------------
