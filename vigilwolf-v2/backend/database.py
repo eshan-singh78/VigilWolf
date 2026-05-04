@@ -99,13 +99,17 @@ class DomainModel(Base):
     dns_records = relationship("DnsRecordModel", back_populates="domain", lazy="dynamic")
     cluster_memberships = relationship("ClusterMemberModel", back_populates="domain", lazy="dynamic")
 
+    __table_args__ = (
+        UniqueConstraint("group_id", "url", name="uq_domain_group_url"),
+    )
+
 
 class SnapshotModel(Base):
     """A captured snapshot of a domain (v1 compatibility + v2 extensions)."""
     __tablename__ = "snapshots"
 
     id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
-    domain_id = Column(String(36), ForeignKey("domains.id"), nullable=False)
+    domain_id = Column(String(36), ForeignKey("domains.id", ondelete="CASCADE"), nullable=False)
     timestamp = Column(DateTime, default=utc_now, nullable=False)
     trigger_type = Column(String(20), nullable=False)
     html_path = Column(Text, nullable=False)
@@ -135,7 +139,7 @@ class PingLogModel(Base):
     __tablename__ = "ping_logs"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
-    domain_id = Column(String(36), ForeignKey("domains.id"), nullable=False)
+    domain_id = Column(String(36), ForeignKey("domains.id", ondelete="CASCADE"), nullable=False)
     timestamp = Column(DateTime, default=utc_now, nullable=False)
     reachable = Column(Boolean, nullable=False)
     status_code = Column(Integer, nullable=True)
@@ -151,10 +155,10 @@ class DumpLogModel(Base):
     __tablename__ = "dump_logs"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
-    domain_id = Column(String(36), ForeignKey("domains.id"), nullable=False)
+    domain_id = Column(String(36), ForeignKey("domains.id", ondelete="CASCADE"), nullable=False)
     timestamp = Column(DateTime, default=utc_now, nullable=False)
     trigger_type = Column(String(20), nullable=False)
-    snapshot_id = Column(String(36), nullable=False)
+    snapshot_id = Column(String(36), ForeignKey("snapshots.id", ondelete="CASCADE"), nullable=False)
     success = Column(Boolean, nullable=False)
     error_message = Column(Text, nullable=True)
     message = Column(Text, nullable=False)
@@ -173,7 +177,7 @@ class DomainProcessingStateModel(Base):
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     domain_id = Column(
-        String(36), ForeignKey("domains.id"), unique=True, nullable=False,
+        String(36), ForeignKey("domains.id", ondelete="CASCADE"), unique=True, nullable=False,
     )
     status = Column(
         String(20), nullable=False, default="pending",
@@ -204,7 +208,7 @@ class DomainIpModel(Base):
     __tablename__ = "domain_ips"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
-    domain_id = Column(String(36), ForeignKey("domains.id"), nullable=False)
+    domain_id = Column(String(36), ForeignKey("domains.id", ondelete="CASCADE"), nullable=False)
     # PostgreSQL would use INET type here; String for SQLite compatibility.
     ip = Column(String(45), nullable=False)
     first_seen = Column(DateTime, default=utc_now, nullable=False)
@@ -223,12 +227,16 @@ class DnsRecordModel(Base):
     __tablename__ = "dns_records"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
-    domain_id = Column(String(36), ForeignKey("domains.id"), nullable=False)
+    domain_id = Column(String(36), ForeignKey("domains.id", ondelete="CASCADE"), nullable=False)
     type = Column(String(10), nullable=False)
     value = Column(Text, nullable=False)
     ttl = Column(Integer, nullable=True)
     first_seen = Column(DateTime, default=utc_now, nullable=False)
     last_seen = Column(DateTime, default=utc_now, nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint("domain_id", "type", "value", name="uq_dns_record_domain_type_value"),
+    )
 
     # relationships
     domain = relationship("DomainModel", back_populates="dns_records")
@@ -239,7 +247,7 @@ class SnapshotPluginStatusModel(Base):
     __tablename__ = "snapshot_plugin_status"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
-    snapshot_id = Column(String(36), ForeignKey("snapshots.id"), nullable=False)
+    snapshot_id = Column(String(36), ForeignKey("snapshots.id", ondelete="CASCADE"), nullable=False)
     plugin_name = Column(String(50), nullable=False)
     status = Column(
         String(20), nullable=False, default="pending",
@@ -262,7 +270,7 @@ class AnalysisResultModel(Base):
     __tablename__ = "analysis_results"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
-    snapshot_id = Column(String(36), ForeignKey("snapshots.id"), nullable=False)
+    snapshot_id = Column(String(36), ForeignKey("snapshots.id", ondelete="CASCADE"), nullable=False)
     plugin_name = Column(String(50), nullable=False)
     plugin_version = Column(String(20), nullable=False)
     plugin_type = Column(
@@ -347,7 +355,7 @@ class AlertModel(Base):
     risk_level = Column(String(10), nullable=True)
     severity = Column(String(10), nullable=False)
     score = Column(Integer, nullable=True)
-    campaign_id = Column(String(36), nullable=True)
+    campaign_id = Column(String(36), ForeignKey("campaigns.id", ondelete="SET NULL"), nullable=True)
     webhook_id = Column(
         String(36), ForeignKey("webhooks.id", ondelete="SET NULL"), nullable=True,
     )
@@ -361,10 +369,15 @@ class AlertModel(Base):
     last_attempt_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=utc_now, nullable=False)
 
+    __table_args__ = (
+        UniqueConstraint("dedup_key", "webhook_id", name="uq_alert_dedup_webhook"),
+    )
+
     # relationships (no back_populates needed — these are log-style references)
     domain = relationship("DomainModel")
     snapshot = relationship("SnapshotModel")
     webhook = relationship("WebhookModel")
+    campaign = relationship("CampaignModel")
 
 
 class AnalystFeedbackModel(Base):
@@ -372,7 +385,7 @@ class AnalystFeedbackModel(Base):
     __tablename__ = "analyst_feedback"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
-    snapshot_id = Column(String(36), ForeignKey("snapshots.id"), nullable=False)
+    snapshot_id = Column(String(36), ForeignKey("snapshots.id", ondelete="CASCADE"), nullable=False)
     label = Column(String(20), nullable=False)
     analyst_id = Column(String(100), nullable=True)
     created_at = Column(DateTime, default=utc_now, nullable=False)
@@ -436,6 +449,9 @@ class IocRelationshipModel(Base):
     """Relationship between two IOCs (same_page, redirect, script_load, shared_hosting)."""
     __tablename__ = "ioc_relationships"
     __table_args__ = (
+        # Note: Application code in ioc_service.py sorts source < target for same_page
+        # relationships to prevent symmetric duplicates. A future migration should add
+        # a CHECK constraint enforcing source_ioc_id < target_ioc_id for "same_page" type.
         UniqueConstraint("source_ioc_id", "target_ioc_id", "relationship_type", name="uq_ioc_relationship"),
     )
 
@@ -594,6 +610,26 @@ class C2CandidateModel(Base):
     detected_at = Column(DateTime, default=utc_now, nullable=False)
 
     ioc = relationship("IocModel")
+
+
+class IntelligencePipelineStatusModel(Base):
+    """Per-snapshot, per-stage status for the intelligence pipeline."""
+    __tablename__ = "intelligence_pipeline_status"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    snapshot_id = Column(String(36), ForeignKey("snapshots.id", ondelete="CASCADE"), nullable=False)
+    stage = Column(String(50), nullable=False)
+    status = Column(
+        String(20), nullable=False, default="queued",
+        # queued | running | done | failed
+    )
+    started_at = Column(DateTime, nullable=True)
+    completed_at = Column(DateTime, nullable=True)
+    error_message = Column(Text, nullable=True)
+
+    __table_args__ = (
+        UniqueConstraint("snapshot_id", "stage", name="uq_intel_pipeline_snapshot_stage"),
+    )
 
 
 # ---------------------------------------------------------------------------
