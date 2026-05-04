@@ -477,13 +477,7 @@ def persist_iocs(
             )
 
     # script_load: script src URLs are linked to the domain they are loaded on
-    # Batch-load all IOCs for this snapshot in a single query (N+1 fix)
-    ioc_rows = (
-        session.query(IocModel)
-        .filter(IocModel.id.in_(snapshot_ioc_ids))
-        .all()
-    ) if snapshot_ioc_ids else []
-    ioc_by_id = {ioc.id: ioc for ioc in ioc_rows}
+    # ioc_by_id already loaded above for same_page priority classification
 
     url_ioc_ids = []
     domain_ioc_ids = []
