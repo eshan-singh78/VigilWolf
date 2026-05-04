@@ -588,6 +588,24 @@ def orchestrate_analysis(ctx: SnapshotContext) -> None:
                         ctx.snapshot_record["registrar"] = result.findings.get("registrar", "")
                     elif result.plugin_name == "dns_enricher" and result.findings:
                         ctx.metadata["dns_records"] = result.findings
+                        # Persist ASN data to DomainIpModel if available
+                        try:
+                            with get_session() as dns_session:
+                                from database import DomainIpModel
+                                domain_id = ctx.snapshot_record.get("domain_id")
+                                asn_value = result.findings.get("asn")
+                                if asn_value and domain_id:
+                                    ip_rows = (
+                                        dns_session.query(DomainIpModel)
+                                        .filter(DomainIpModel.domain_id == domain_id)
+                                        .all()
+                                    )
+                                    for ip_row in ip_rows:
+                                        if not ip_row.asn:
+                                            ip_row.asn = str(asn_value)
+                                    dns_session.commit()
+                        except Exception:
+                            logger.debug("Failed to persist ASN for domain_id=%s", ctx.snapshot_record.get("domain_id", "")[:8])
 
                     # Store AnalysisResultModel
                     with get_session() as session:
