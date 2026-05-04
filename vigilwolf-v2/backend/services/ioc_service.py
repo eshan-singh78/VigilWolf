@@ -352,24 +352,45 @@ def persist_iocs(
 
     # Build relationships -------------------------------------------------
 
-    # same_page: pairwise between all IOCs found in this snapshot.
-    # Cap at MAX_SAME_PAGE_RELATIONSHIPS to prevent O(n^2) explosion.
-    if len(snapshot_ioc_ids) >= 2:
-        sorted_ids = sorted(set(snapshot_ioc_ids))
-        pairs = [
-            (sorted_ids[i], sorted_ids[j])
-            for i in range(len(sorted_ids))
-            for j in range(i + 1, len(sorted_ids))
-        ]
-        # Cap total relationships per snapshot
-        if len(pairs) > MAX_SAME_PAGE_RELATIONSHIPS:
-            logger.info(
-                "Capping same_page relationships for snapshot %s: %d -> %d",
-                snapshot_id, len(pairs), MAX_SAME_PAGE_RELATIONSHIPS,
-            )
-            pairs = pairs[:MAX_SAME_PAGE_RELATIONSHIPS]
+    # Batch-load all IOCs for this snapshot in a single query (N+1 fix)
+    ioc_rows = (
+        session.query(IocModel)
+        .filter(IocModel.id.in_(snapshot_ioc_ids))
+    ) if snapshot_ioc_ids else []
+    ioc_by_id = {ioc.id: ioc for ioc in ioc_rows}
 
-        for src_id, tgt_id in pairs:
+    # S-3: Priority-based same_page generation.
+    # Classify IOCs as high-value (exfil_endpoint, telegram, wallet) or standard,
+    # then generate pairs in priority order with a running cap.
+    if len(snapshot_ioc_ids) >= 2:
+        # Classify each IOC for priority tiering
+        high_value_ids: list[int] = []
+        standard_ids: list[int] = []
+        for ioc_id in snapshot_ioc_ids:
+            ioc = ioc_by_id.get(ioc_id) if ioc_by_id else None
+            if ioc is None:
+                standard_ids.append(ioc_id)
+                continue
+            is_high_value = (
+                ioc.type in ("telegram", "wallet")
+                or (ioc.type == "url" and _classify_role("url", ioc.value) == "exfil_endpoint")
+            )
+            if is_high_value:
+                high_value_ids.append(ioc_id)
+            else:
+                standard_ids.append(ioc_id)
+
+        # Deduplicate
+        high_value_ids = sorted(set(high_value_ids))
+        standard_ids = sorted(set(standard_ids))
+
+        pair_count = 0
+        max_pairs = MAX_SAME_PAGE_RELATIONSHIPS
+
+        def _add_pair(src_id: int, tgt_id: int) -> bool:
+            nonlocal pair_count, relationships_created
+            if pair_count >= max_pairs:
+                return False
             try:
                 with session.begin_nested():
                     rel = IocRelationshipModel(
@@ -381,17 +402,53 @@ def persist_iocs(
                     session.add(rel)
                     session.flush()
                 relationships_created += 1
+                pair_count += 1
+                return True
             except Exception:
                 logger.debug(
                     "IOC relationship already exists: %d -> %d (same_page)",
                     src_id, tgt_id,
                 )
+                return True  # Already exists, count as done
+
+        # Priority 1: high-value <-> high-value
+        for i in range(len(high_value_ids)):
+            for j in range(i + 1, len(high_value_ids)):
+                if not _add_pair(high_value_ids[i], high_value_ids[j]):
+                    break
+            if pair_count >= max_pairs:
+                break
+
+        # Priority 2: high-value <-> standard
+        if pair_count < max_pairs:
+            for hv_id in high_value_ids:
+                for std_id in standard_ids:
+                    if not _add_pair(hv_id, std_id):
+                        break
+                if pair_count >= max_pairs:
+                    break
+
+        # Priority 3: standard <-> standard
+        if pair_count < max_pairs:
+            for i in range(len(standard_ids)):
+                for j in range(i + 1, len(standard_ids)):
+                    if not _add_pair(standard_ids[i], standard_ids[j]):
+                        break
+                if pair_count >= max_pairs:
+                    break
+
+        if pair_count >= max_pairs and len(snapshot_ioc_ids) > 10:
+            logger.info(
+                "Capped same_page relationships for snapshot %s at %d (total possible: %d)",
+                snapshot_id, max_pairs,
+                len(snapshot_ioc_ids) * (len(snapshot_ioc_ids) - 1) // 2,
+            )
 
     # script_load: script src URLs are linked to the domain they are loaded on
     url_ioc_ids = []
     domain_ioc_ids = []
     for ioc_id in snapshot_ioc_ids:
-        ioc = session.query(IocModel).get(ioc_id)
+        ioc = ioc_by_id.get(ioc_id)
         if ioc is None:
             continue
         if ioc.type == "url" and _is_script_src_url(ioc.value):
@@ -400,7 +457,7 @@ def persist_iocs(
             domain_ioc_ids.append(ioc_id)
 
     for url_id in url_ioc_ids:
-        url_ioc = session.query(IocModel).get(url_id)
+        url_ioc = ioc_by_id.get(url_id)
         if url_ioc is None:
             continue
         parsed = urlparse(url_ioc.value)
@@ -409,7 +466,7 @@ def persist_iocs(
             continue
 
         for domain_id in domain_ioc_ids:
-            domain_ioc = session.query(IocModel).get(domain_id)
+            domain_ioc = ioc_by_id.get(domain_id)
             if domain_ioc is None:
                 continue
             if domain_ioc.value.lower() == domain_host:
