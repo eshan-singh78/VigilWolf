@@ -181,7 +181,21 @@ def run_periodic_reconciliation() -> dict:
     except Exception:
         logger.exception("Missing pipeline reconciliation failed")
 
-    return {**result, **ioc_result, **pipeline_result}
+    # Cluster count reconciliation — fix domain_count drift (D-1)
+    cluster_result = {}
+    try:
+        from database import get_session
+        from services.reconciliation_service import reconcile_cluster_counts
+
+        with get_session() as session:
+            cluster_result = reconcile_cluster_counts(session)
+            session.commit()
+
+        logger.info("Cluster count reconciliation complete: %s", cluster_result)
+    except Exception:
+        logger.exception("Cluster count reconciliation failed")
+
+    return {**result, **ioc_result, **pipeline_result, **cluster_result}
 
 
 _reconciliation_thread: Optional[_threading.Thread] = None
