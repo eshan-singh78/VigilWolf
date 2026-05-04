@@ -235,6 +235,59 @@ def _generate_campaign_name(brand: str, signature_hash: str | None = None) -> st
     return f"{base}_{uuid.uuid4().hex[:8]}"
 
 
+def _count_shared_iocs(
+    cluster_domain_ids: set[str],
+    campaign_id: str,
+    session,
+) -> int:
+    """Count distinct IOC IDs shared between a cluster's domains and a campaign.
+
+    Used when kit_signature is missing to decide if two same-brand clusters
+    should be merged into the same campaign (H-2). If >= 3 shared IOCs,
+    they likely belong to the same actor and should merge.
+    """
+    from database import (  # type: ignore[import-untyped]
+        CampaignClusterModel,
+        ClusterMemberModel,
+        IocOccurrenceModel,
+        SnapshotModel,
+    )
+    from sqlalchemy import func as sa_func
+
+    campaign_domain_ids_result = (
+        session.query(ClusterMemberModel.domain_id)
+        .join(CampaignClusterModel, CampaignClusterModel.cluster_id == ClusterMemberModel.cluster_id)
+        .filter(CampaignClusterModel.campaign_id == campaign_id)
+        .distinct()
+        .subquery()
+    )
+
+    campaign_ioc_ids = (
+        session.query(IocOccurrenceModel.ioc_id)
+        .join(SnapshotModel, SnapshotModel.id == IocOccurrenceModel.snapshot_id)
+        .filter(SnapshotModel.domain_id.in_(campaign_domain_ids_result))
+        .distinct()
+        .subquery()
+    )
+
+    cluster_ioc_ids = (
+        session.query(IocOccurrenceModel.ioc_id)
+        .join(SnapshotModel, SnapshotModel.id == IocOccurrenceModel.snapshot_id)
+        .filter(SnapshotModel.domain_id.in_(cluster_domain_ids))
+        .distinct()
+        .subquery()
+    )
+
+    shared_count = (
+        session.query(sa_func.count())
+        .select_from(cluster_ioc_ids)
+        .filter(cluster_ioc_ids.c.ioc_id.in_(campaign_ioc_ids))
+        .scalar()
+    )
+
+    return shared_count or 0
+
+
 # ---------------------------------------------------------------------------
 # Campaign detection
 # ---------------------------------------------------------------------------
@@ -419,23 +472,61 @@ def detect_campaigns(session) -> dict:
                     and cluster_sig != campaign_sig
                 )
                 sig_missing = cluster_sig is None or campaign_sig is None
-                if sig_mismatch or sig_missing:
-                    if sig_mismatch:
-                        logger.debug(
-                            "Cluster %s signature %s does not match campaign %s signature %s; "
-                            "creating separate campaign for brand %s",
-                            cluster.id[:8], cluster_sig[:12] if cluster_sig else "None",
-                            existing_brand_campaign.id[:8], campaign_sig[:12] if campaign_sig else "None",
-                            brand,
+                if sig_mismatch:
+                    logger.debug(
+                        "Cluster %s signature %s does not match campaign %s signature %s; "
+                        "creating separate campaign for brand %s",
+                        cluster.id[:8], cluster_sig[:12] if cluster_sig else "None",
+                        existing_brand_campaign.id[:8], campaign_sig[:12] if campaign_sig else "None",
+                        brand,
+                    )
+                    # Fall through to create new campaign below.
+                elif sig_missing:
+                    # H-2: When signatures are missing, use IOC overlap as merge heuristic.
+                    from database import ClusterMemberModel  # type: ignore[import-untyped]
+                    cluster_domain_ids = {
+                        row.domain_id for row in
+                        session.query(ClusterMemberModel.domain_id)
+                        .filter(ClusterMemberModel.cluster_id == cluster.id)
+                        .all()
+                    }
+                    shared_iocs = _count_shared_iocs(cluster_domain_ids, existing_brand_campaign.id, session)
+                    if shared_iocs >= 3:
+                        logger.info(
+                            "Merging cluster %s into campaign %s for brand %s: "
+                            "%d shared IOCs despite missing kit_signature (H-2)",
+                            cluster.id[:8], existing_brand_campaign.id[:8], brand, shared_iocs,
                         )
+                        try:
+                            with session.begin_nested():
+                                link = CampaignClusterModel(
+                                    campaign_id=existing_brand_campaign.id,
+                                    cluster_id=cluster.id,
+                                )
+                                session.add(link)
+                                session.flush()
+                        except Exception:
+                            logger.debug(
+                                "Cluster %s already linked to campaign %s",
+                                cluster.id[:8], existing_brand_campaign.id[:8],
+                            )
+                        _recompute_domain_count(existing_brand_campaign, session)
+                        existing_brand_campaign.last_seen = max(
+                            existing_brand_campaign.last_seen or datetime.now(timezone.utc),
+                            cluster.last_seen or datetime.now(timezone.utc),
+                        )
+                        if existing_brand_campaign.status == "dormant":
+                            existing_brand_campaign.status = "active"
+                        campaigns_updated += 1
+                        cluster.last_campaign_check = datetime.now(timezone.utc)
+                        continue
                     else:
                         logger.info(
-                            "Cannot verify signature alignment for cluster %s against campaign %s "
-                            "(cluster_sig=%s, campaign_sig=%s); creating separate campaign for brand %s",
-                            cluster.id[:8], existing_brand_campaign.id[:8],
-                            cluster_sig, campaign_sig, brand,
+                            "Cannot verify signature for cluster %s against campaign %s "
+                            "and only %d shared IOCs (< 3); creating separate campaign for brand %s",
+                            cluster.id[:8], existing_brand_campaign.id[:8], shared_iocs, brand,
                         )
-                    # Fall through to create a new campaign below.
+                        # Fall through to create new campaign below.
                 else:
                     # Signatures match — safe to merge.
                     try:

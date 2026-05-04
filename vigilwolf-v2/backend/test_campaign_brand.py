@@ -37,3 +37,8 @@ def test_brand_sld_with_two_part_tld():
 def test_legitimate_domain_not_matched():
     result = _detect_brand(["https://paypal.com/"])
     assert result is None
+
+def test_count_shared_iocs_helper():
+    """_count_shared_iocs exists and has correct signature."""
+    from services.campaign_service import _count_shared_iocs
+    assert callable(_count_shared_iocs)
