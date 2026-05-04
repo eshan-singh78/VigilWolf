@@ -57,6 +57,7 @@ _LEGITIMATE_DOMAIN_DENYLIST = {
     "ups.com", "google.com", "microsoft.com", "amazon.com",
     "netflix.com", "linkedin.com", "facebook.com", "twitter.com",
     "x.com", "stripe.com", "shopify.com", "citibank.com",
+    "paypal.com",
 }
 
 
@@ -77,6 +78,30 @@ def _is_denied_domain(hostname: str) -> bool:
         if hostname_lower.endswith(f".{denied}"):
             return True
     return False
+
+# Two-part TLDs where the SLD is the third-to-last segment.
+_TWO_PART_TLDS = frozenset({
+    "co.uk", "co.jp", "co.nz", "co.za", "co.in", "co.kr",
+    "com.au", "com.br", "com.cn", "com.mx", "com.ar",
+    "co.il", "co.ke", "co.th", "co.id",
+})
+
+
+def _extract_sld(hostname: str) -> str:
+    """Extract the second-level domain from a hostname."""
+    if not hostname:
+        return ""
+    h = hostname.lower()
+    if h.startswith("www."):
+        h = h[4:]
+    parts = h.split(".")
+    if len(parts) < 2:
+        return h
+    if len(parts) >= 3:
+        potential_tld = f"{parts[-2]}.{parts[-1]}"
+        if potential_tld in _TWO_PART_TLDS:
+            return parts[-3] if len(parts) >= 3 else parts[0]
+    return parts[-2]
 
 # Ordered by specificity — longer keywords first to avoid partial matches.
 BRAND_KEYWORDS: list[tuple[str, str]] = [
@@ -169,7 +194,9 @@ def _detect_brand(domain_urls: list[str]) -> Optional[str]:
     if not hostnames:
         return None
 
-    combined = " ".join(hostnames)
+    # Extract SLDs from hostnames for brand matching (F-2).
+    slds = [_extract_sld(h) for h in hostnames]
+    combined = " ".join(slds)
     for keyword, brand in BRAND_KEYWORDS:
         # Skip short keywords and denylisted terms to reduce false positives.
         if len(keyword) < _BRAND_MIN_LENGTH and keyword.lower() not in _SHORT_BRAND_ALLOWLIST:
