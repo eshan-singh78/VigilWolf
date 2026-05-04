@@ -36,6 +36,9 @@ logger = logging.getLogger(__name__)
 RECONCILIATION_INTERVAL_S = 15 * 60  # 15 minutes
 C2_RANKING_INTERVAL_S = 60 * 60  # 1 hour
 ACTOR_PROFILING_INTERVAL_S = 60 * 60  # 1 hour
+BATCH_CLUSTERING_INTERVAL_S = config.BATCH_CLUSTERING_INTERVAL_S
+BATCH_CAMPAIGN_INTERVAL_S = config.BATCH_CAMPAIGN_INTERVAL_S
+BATCH_PHISHKIT_INTERVAL_S = config.BATCH_PHISHKIT_INTERVAL_S
 MAX_HTML_SIZE = 10 * 1024 * 1024  # 10 MB — reject HTML payloads larger than this
 
 
@@ -96,12 +99,30 @@ def _get_actors():
         """Periodic task to profile threat actors across all campaigns."""
         run_periodic_actor_profiling()
 
+    @dramatiq.actor(broker=broker, max_retries=1, max_age=3600000, time_limit=300000)
+    def batch_clustering_actor():
+        """Periodic task to run clustering across all new snapshots."""
+        run_periodic_batch_clustering()
+
+    @dramatiq.actor(broker=broker, max_retries=1, max_age=3600000, time_limit=600000)
+    def batch_campaign_actor():
+        """Periodic task to run campaign detection across all clusters."""
+        run_periodic_batch_campaign()
+
+    @dramatiq.actor(broker=broker, max_retries=1, max_age=3600000, time_limit=300000)
+    def batch_phishkit_actor():
+        """Periodic task to run phishkit detection across all snapshots."""
+        run_periodic_batch_phishkit()
+
     _dramatiq_actors = {
         "capture_domain": capture_domain_actor,
         "build_context_and_analyze": build_context_and_analyze_actor,
         "reconcile_orphaned_statuses": reconcile_orphaned_statuses,
         "rank_c2_candidates_periodic": rank_c2_candidates_periodic,
         "profile_actors_periodic": profile_actors_periodic,
+        "batch_clustering": batch_clustering_actor,
+        "batch_campaign": batch_campaign_actor,
+        "batch_phishkit": batch_phishkit_actor,
     }
     return _dramatiq_actors
 
@@ -362,6 +383,186 @@ def start_periodic_actor_profiling() -> None:
     )
     _actor_profiling_thread.start()
     logger.info("Started periodic actor profiling scheduler (interval=%ds)", ACTOR_PROFILING_INTERVAL_S)
+
+
+# ---------------------------------------------------------------------------
+# Periodic batch clustering (C-2: replaces per-snapshot clustering)
+# ---------------------------------------------------------------------------
+
+def run_periodic_batch_clustering() -> dict:
+    """Synchronous batch clustering runner — manages its own DB session."""
+    logger.info("Starting periodic batch clustering")
+    try:
+        from database import get_session
+        from services.clustering_service import cluster_by_structural_hash, cluster_by_infrastructure
+
+        with get_session() as session:
+            struct_result = cluster_by_structural_hash(session)
+            session.commit()
+        with get_session() as session:
+            infra_result = cluster_by_infrastructure(session)
+            session.commit()
+
+        logger.info("Periodic batch clustering complete: struct=%s infra=%s", struct_result, infra_result)
+        return {"clustering_struct": struct_result, "clustering_infra": infra_result}
+    except Exception:
+        logger.exception("Periodic batch clustering failed")
+        return {"error": True}
+
+
+_batch_clustering_thread: Optional[_threading.Thread] = None
+
+
+def _batch_clustering_scheduler_loop() -> None:
+    """Daemon thread that periodically enqueues batch clustering messages."""
+    _time.sleep(60)
+    while True:
+        try:
+            if config.USE_DRAMATIQ_PIPELINE:
+                actors = _get_actors()
+                actors["batch_clustering"].send()
+            else:
+                run_periodic_batch_clustering()
+        except Exception:
+            logger.exception("Batch clustering scheduler error; will retry next interval")
+        _time.sleep(BATCH_CLUSTERING_INTERVAL_S)
+
+
+def start_periodic_batch_clustering() -> None:
+    """Start the background batch clustering scheduler (idempotent)."""
+    global _batch_clustering_thread
+    if not config.CLUSTERING_ENABLED or not config.BATCH_CLUSTERING_ENABLED:
+        logger.info("Batch clustering disabled; skipping scheduler.")
+        return
+    if _batch_clustering_thread is not None and _batch_clustering_thread.is_alive():
+        logger.info("Periodic batch clustering scheduler already running; skipping.")
+        return
+
+    _batch_clustering_thread = _threading.Thread(
+        target=_batch_clustering_scheduler_loop,
+        name="vigilwolf-batch-clustering-scheduler",
+        daemon=True,
+    )
+    _batch_clustering_thread.start()
+    logger.info("Started periodic batch clustering scheduler (interval=%ds)", BATCH_CLUSTERING_INTERVAL_S)
+
+
+# ---------------------------------------------------------------------------
+# Periodic batch campaign detection (C-2: replaces per-snapshot campaign)
+# ---------------------------------------------------------------------------
+
+def run_periodic_batch_campaign() -> dict:
+    """Synchronous batch campaign detection runner — manages its own DB session."""
+    logger.info("Starting periodic batch campaign detection")
+    try:
+        from database import get_session
+        from services.campaign_service import detect_campaigns
+
+        with get_session() as session:
+            result = detect_campaigns(session)
+            session.commit()
+
+        logger.info("Periodic batch campaign detection complete: %s", result)
+        return result
+    except Exception:
+        logger.exception("Periodic batch campaign detection failed")
+        return {"error": True}
+
+
+_batch_campaign_thread: Optional[_threading.Thread] = None
+
+
+def _batch_campaign_scheduler_loop() -> None:
+    """Daemon thread that periodically enqueues batch campaign messages."""
+    _time.sleep(90)
+    while True:
+        try:
+            if config.USE_DRAMATIQ_PIPELINE:
+                actors = _get_actors()
+                actors["batch_campaign"].send()
+            else:
+                run_periodic_batch_campaign()
+        except Exception:
+            logger.exception("Batch campaign scheduler error; will retry next interval")
+        _time.sleep(BATCH_CAMPAIGN_INTERVAL_S)
+
+
+def start_periodic_batch_campaign() -> None:
+    """Start the background batch campaign scheduler (idempotent)."""
+    global _batch_campaign_thread
+    if not config.CAMPAIGN_DETECTION_ENABLED or not config.BATCH_CAMPAIGN_ENABLED:
+        logger.info("Batch campaign detection disabled; skipping scheduler.")
+        return
+    if _batch_campaign_thread is not None and _batch_campaign_thread.is_alive():
+        logger.info("Periodic batch campaign scheduler already running; skipping.")
+        return
+
+    _batch_campaign_thread = _threading.Thread(
+        target=_batch_campaign_scheduler_loop,
+        name="vigilwolf-batch-campaign-scheduler",
+        daemon=True,
+    )
+    _batch_campaign_thread.start()
+    logger.info("Started periodic batch campaign scheduler (interval=%ds)", BATCH_CAMPAIGN_INTERVAL_S)
+
+
+# ---------------------------------------------------------------------------
+# Periodic batch phishkit detection (C-2: replaces per-snapshot phishkit)
+# ---------------------------------------------------------------------------
+
+def run_periodic_batch_phishkit() -> dict:
+    """Synchronous batch phishkit detection runner — manages its own DB session."""
+    logger.info("Starting periodic batch phishkit detection")
+    try:
+        from database import get_session
+        from services.phishkit_service import detect_phishkits
+
+        with get_session() as session:
+            result = detect_phishkits(session)
+            session.commit()
+
+        logger.info("Periodic batch phishkit detection complete: %s", result)
+        return result
+    except Exception:
+        logger.exception("Periodic batch phishkit detection failed")
+        return {"error": True}
+
+
+_batch_phishkit_thread: Optional[_threading.Thread] = None
+
+
+def _batch_phishkit_scheduler_loop() -> None:
+    """Daemon thread that periodically enqueues batch phishkit messages."""
+    _time.sleep(45)
+    while True:
+        try:
+            if config.USE_DRAMATIQ_PIPELINE:
+                actors = _get_actors()
+                actors["batch_phishkit"].send()
+            else:
+                run_periodic_batch_phishkit()
+        except Exception:
+            logger.exception("Batch phishkit scheduler error; will retry next interval")
+        _time.sleep(BATCH_PHISHKIT_INTERVAL_S)
+
+
+def start_periodic_batch_phishkit() -> None:
+    """Start the background batch phishkit scheduler (idempotent)."""
+    global _batch_phishkit_thread
+    if not config.PHISHKIT_DETECTION_ENABLED or not config.BATCH_PHISHKIT_ENABLED:
+        logger.info("Batch phishkit detection disabled; skipping scheduler.")
+        return
+    if _batch_phishkit_thread is not None and _batch_phishkit_thread.is_alive():
+        logger.info("Periodic batch phishkit scheduler already running; skipping.")
+        return
+
+    _batch_phishkit_thread = _threading.Thread(
+        target=_batch_phishkit_scheduler_loop,
+        name="vigilwolf-batch-phishkit-scheduler",
+        daemon=True,
+    )
+    _batch_phishkit_thread.start()
+    logger.info("Started periodic batch phishkit scheduler (interval=%ds)", BATCH_PHISHKIT_INTERVAL_S)
 
 
 # ---------------------------------------------------------------------------
