@@ -76,10 +76,10 @@ def _get_actors():
         return result
 
     @dramatiq.actor(broker=broker, max_retries=3, max_age=3600000, time_limit=300000)
-    def build_context_and_analyze_actor(snapshot_id: str, domain_id: str, url: str, html: str, snapshot_record: dict):
+    def build_context_and_analyze_actor(snapshot_id: str, domain_id: str, url: str, snapshot_record: dict):
         build_context_and_analyze(
             snapshot_id=snapshot_id, domain_id=domain_id, url=url,
-            html=html, snapshot_record=snapshot_record,
+            snapshot_record=snapshot_record,
         )
 
     @dramatiq.actor(broker=broker, max_retries=1, max_age=3600000, time_limit=120000)
@@ -103,22 +103,35 @@ def run_periodic_reconciliation() -> dict:
     """Synchronous reconciliation runner — manages its own DB session.
 
     Called by the Dramatiq actor and by the background scheduler thread.
-    Returns the reconciliation result dict for logging.
+    Runs both orphan-status reconciliation and cluster domain_count reconciliation.
+    Returns the combined reconciliation result dict for logging.
     """
     logger.info("Starting periodic orphan status reconciliation")
+    result = {"reconciled_running": 0, "reconciled_pending": 0}
     try:
         from database import get_session
         from services.reconciliation_service import reconcile_orphaned_statuses
 
         with get_session() as session:
-            result = reconcile_orphaned_statuses(session)
+            orphan_result = reconcile_orphaned_statuses(session)
             session.commit()
-
-        logger.info("Periodic reconciliation complete: %s", result)
-        return result
+        result.update(orphan_result)
     except Exception:
-        logger.exception("Periodic reconciliation failed")
-        return {"reconciled_running": 0, "reconciled_pending": 0, "error": True}
+        logger.exception("Orphan status reconciliation failed")
+
+    try:
+        from database import get_session
+        from services.clustering_service import reconcile_cluster_domain_counts
+
+        with get_session() as session:
+            cluster_result = reconcile_cluster_domain_counts(session)
+            session.commit()
+        result.update(cluster_result)
+    except Exception:
+        logger.exception("Cluster domain_count reconciliation failed")
+
+    logger.info("Periodic reconciliation complete: %s", result)
+    return result
 
 
 _reconciliation_thread: Optional[_threading.Thread] = None
@@ -372,7 +385,7 @@ def capture_domain(domain_id: str, url: str, trigger_type: str = "nrd_ingest") -
         sha256 = hashlib.sha256(html.encode("utf-8", errors="replace")).hexdigest()
 
         # Step 3 — Duplicate check & snapshot insert (single session to prevent race)
-        from database import get_session, SnapshotModel
+        from database import get_session, SnapshotModel, SnapshotPluginStatusModel
         from sqlalchemy.exc import IntegrityError
 
         snapshot_id = str(uuid.uuid4())
@@ -396,6 +409,34 @@ def capture_domain(domain_id: str, url: str, trigger_type: str = "nrd_ingest") -
                     "Duplicate snapshot for domain_id=%s sha256=%s; skipping.",
                     domain_id, sha256[:12],
                 )
+                # H-4: Check if this snapshot has any plugin status rows.
+                # If not, the snapshot was created but analysis was never kicked
+                # off (e.g. worker crashed before enqueue). Re-enqueue analysis.
+                plugin_count = (
+                    session.query(SnapshotPluginStatusModel)
+                    .filter_by(snapshot_id=existing.id)
+                    .count()
+                )
+                if plugin_count == 0:
+                    logger.info(
+                        "Orphaned snapshot detected for snapshot_id=%s; re-enqueuing analysis.",
+                        existing.id,
+                    )
+                    if config.USE_DRAMATIQ_PIPELINE:
+                        actors = _get_actors()
+                        actors["build_context_and_analyze"].send(
+                            snapshot_id=existing.id,
+                            domain_id=domain_id,
+                            url=url,
+                            snapshot_record={"id": existing.id, "domain_id": domain_id},
+                        )
+                    else:
+                        build_context_and_analyze(
+                            snapshot_id=existing.id,
+                            domain_id=domain_id,
+                            url=url,
+                            snapshot_record={"id": existing.id, "domain_id": domain_id},
+                        )
                 return existing.id
 
             try:
@@ -458,7 +499,6 @@ def capture_domain(domain_id: str, url: str, trigger_type: str = "nrd_ingest") -
                 snapshot_id=snapshot_id,
                 domain_id=domain_id,
                 url=url,
-                html=html,
                 snapshot_record=snapshot_record_dict,
             )
         else:
@@ -466,7 +506,6 @@ def capture_domain(domain_id: str, url: str, trigger_type: str = "nrd_ingest") -
                 snapshot_id=snapshot_id,
                 domain_id=domain_id,
                 url=url,
-                html=html,
                 snapshot_record=snapshot_record_dict,
             )
 
@@ -485,10 +524,26 @@ def build_context_and_analyze(
     snapshot_id: str,
     domain_id: str,
     url: str,
-    html: str,
     snapshot_record: dict,
 ) -> None:
-    """Build a SnapshotContext and run the full analysis pipeline."""
+    """Build a SnapshotContext and run the full analysis pipeline.
+
+    HTML is loaded from disk via storage_manager.load_snapshot() rather
+    than passed inline in the Dramatiq message, which avoids bloating
+    the Redis payload and improves retry safety.
+    """
+    try:
+        from plugins.storage_manager import load_snapshot as _load_snapshot  # type: ignore[import-untyped]
+        html = _load_snapshot(domain_id=domain_id, snapshot_id=snapshot_id)
+    except ImportError:
+        if config.ENVIRONMENT == "production":
+            raise RuntimeError("storage_manager module missing in production")
+        logger.warning("storage_manager not available; cannot load snapshot HTML.")
+        return
+    except FileNotFoundError:
+        logger.error("Snapshot HTML not found for domain_id=%s snapshot_id=%s; skipping analysis.", domain_id, snapshot_id)
+        return
+
     # Extract domain from URL for the context
     parsed = urlparse(url)
     domain = parsed.netloc or url
@@ -589,23 +644,40 @@ def orchestrate_analysis(ctx: SnapshotContext) -> None:
                     elif result.plugin_name == "dns_enricher" and result.findings:
                         ctx.metadata["dns_records"] = result.findings
 
-                    # Store AnalysisResultModel
+                    # Store AnalysisResultModel (H-5: upsert on duplicate snapshot_id+plugin_name)
                     with get_session() as session:
-                        analysis_row = AnalysisResultModel(
-                            snapshot_id=ctx.snapshot_id,
-                            plugin_name=result.plugin_name,
-                            plugin_version=result.plugin_version,
-                            plugin_type=result.plugin_type.value,
-                            result_json={
+                        existing_analysis = (
+                            session.query(AnalysisResultModel)
+                            .filter_by(snapshot_id=ctx.snapshot_id, plugin_name=result.plugin_name)
+                            .first()
+                        )
+                        if existing_analysis:
+                            existing_analysis.plugin_version = result.plugin_version
+                            existing_analysis.plugin_type = result.plugin_type.value
+                            existing_analysis.result_json = {
                                 "tags": result.tags,
                                 "findings": result.findings,
                                 "error": result.error,
-                            },
-                            score_contribution=result.score_contribution,
-                            confidence=result.confidence,
-                            tags=result.tags,
-                        )
-                        session.add(analysis_row)
+                            }
+                            existing_analysis.score_contribution = result.score_contribution
+                            existing_analysis.confidence = result.confidence
+                            existing_analysis.tags = result.tags
+                        else:
+                            analysis_row = AnalysisResultModel(
+                                snapshot_id=ctx.snapshot_id,
+                                plugin_name=result.plugin_name,
+                                plugin_version=result.plugin_version,
+                                plugin_type=result.plugin_type.value,
+                                result_json={
+                                    "tags": result.tags,
+                                    "findings": result.findings,
+                                    "error": result.error,
+                                },
+                                score_contribution=result.score_contribution,
+                                confidence=result.confidence,
+                                tags=result.tags,
+                            )
+                            session.add(analysis_row)
                         session.commit()
 
                     # Update status -> done
@@ -690,8 +762,31 @@ def orchestrate_analysis(ctx: SnapshotContext) -> None:
         if ioc_persisted or not ioc_results:
             if config.INTELLIGENCE_PIPELINE_ENABLED:
                 try:
-                    from intelligence_worker import enqueue_intelligence_pipeline
-                    enqueue_intelligence_pipeline(ctx.snapshot_id)
+                    from database import IntelligencePipelineStatusModel  # type: ignore[import-untyped]
+                    # C-3: Dedup guard — skip if a pipeline row already exists with
+                    # status "queued" or "running" for this snapshot.
+                    with get_session() as dedup_session:
+                        existing_pipeline = (
+                            dedup_session.query(IntelligencePipelineStatusModel)
+                            .filter_by(snapshot_id=ctx.snapshot_id, stage="pipeline")
+                            .filter(IntelligencePipelineStatusModel.status.in_(["queued", "running"]))
+                            .first()
+                        )
+                        if existing_pipeline:
+                            logger.info(
+                                "Intelligence pipeline already queued/running for snapshot_id=%s; skipping enqueue.",
+                                ctx.snapshot_id,
+                            )
+                        else:
+                            # Mark as "queued" before enqueuing to close the race window
+                            from intelligence_worker import enqueue_intelligence_pipeline
+                            dedup_session.add(IntelligencePipelineStatusModel(
+                                snapshot_id=ctx.snapshot_id,
+                                stage="pipeline",
+                                status="queued",
+                            ))
+                            dedup_session.commit()
+                            enqueue_intelligence_pipeline(ctx.snapshot_id)
                 except Exception:
                     logger.exception("Failed to enqueue intelligence pipeline for snapshot_id=%s", ctx.snapshot_id)
 
@@ -745,28 +840,26 @@ def aggregate_results(ctx: SnapshotContext, results: list[PluginResult]) -> dict
         score_outcome["severity"] = "critical"
         score_outcome["risk_level"] = "high"
 
-    # Persist RiskScoreModel (savepoint isolates the insert so an
-    # IntegrityError doesn't lose the entire session state)
+    # Persist RiskScoreModel — H-5: use session.merge() so that retries
+    # and re-runs update the existing row instead of failing on the unique
+    # constraint (snapshot_id).
     with get_session() as session:
         try:
-            with session.begin_nested():
-                risk_score = RiskScoreModel(
-                    snapshot_id=ctx.snapshot_id,
-                    total_score=score_outcome["score"],
-                    normalized_score=score_outcome["normalized_score"],
-                    risk_level=score_outcome["risk_level"],
-                    severity=score_outcome["severity"],
-                    reasons=score_outcome["reasons"],
-                    dominant_signals=score_outcome["dominant_signals"],
-                    plugin_breakdown=score_outcome["plugin_breakdown"],
-                    overall_confidence=score_outcome["overall_confidence"],
-                )
-                session.add(risk_score)
-                session.flush()
+            risk_score = RiskScoreModel(
+                snapshot_id=ctx.snapshot_id,
+                total_score=score_outcome["score"],
+                normalized_score=score_outcome["normalized_score"],
+                risk_level=score_outcome["risk_level"],
+                severity=score_outcome["severity"],
+                reasons=score_outcome["reasons"],
+                dominant_signals=score_outcome["dominant_signals"],
+                plugin_breakdown=score_outcome["plugin_breakdown"],
+                overall_confidence=score_outcome["overall_confidence"],
+            )
+            session.merge(risk_score)
+            session.commit()
         except Exception:
             logger.exception("Failed to persist RiskScoreModel for snapshot_id=%s", ctx.snapshot_id)
-        else:
-            session.commit()
 
     # Publish threat_detected event for SSE streaming
     if score_outcome["risk_level"] in ("high", "medium"):
