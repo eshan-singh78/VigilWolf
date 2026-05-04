@@ -86,6 +86,7 @@ class DomainModel(Base):
     created_at = Column(DateTime, default=utc_now, nullable=False)
     last_checked_at = Column(DateTime, nullable=True)
     active = Column(Boolean, default=True, nullable=False)
+    registrar = Column(String(200), nullable=True)
 
     # relationships
     group = relationship("GroupModel", back_populates="domains")
@@ -209,6 +210,7 @@ class DomainIpModel(Base):
     ip = Column(String(45), nullable=False)
     first_seen = Column(DateTime, default=utc_now, nullable=False)
     last_seen = Column(DateTime, default=utc_now, nullable=False)
+    asn = Column(String(20), nullable=True)
 
     __table_args__ = (
         UniqueConstraint("domain_id", "ip", name="uq_domain_ip"),
@@ -488,6 +490,20 @@ class ClusterMemberModel(Base):
     __table_args__ = (UniqueConstraint("cluster_id", "domain_id"),)
 
 
+class ClusteringWatermarkModel(Base):
+    """Tracks the last-processed timestamp for incremental clustering.
+
+    Each clustering pass (structural_hash, infra) stores its watermark so
+    subsequent runs only process snapshots newer than the watermark rather
+    than re-scanning the entire 30-day window.
+    """
+    __tablename__ = "clustering_watermarks"
+
+    id = Column(String(50), primary_key=True)  # e.g. "structural_hash", "infra"
+    last_processed_at = Column(DateTime, nullable=False)
+    updated_at = Column(DateTime, default=utc_now, nullable=False)
+
+
 # ===========================================================================
 # Phase 3 — PhishKit models
 # ===========================================================================
@@ -594,6 +610,31 @@ class C2CandidateModel(Base):
     detected_at = Column(DateTime, default=utc_now, nullable=False)
 
     ioc = relationship("IocModel")
+
+
+# ===========================================================================
+# Intelligence pipeline status tracking
+# ===========================================================================
+
+class IntelligencePipelineStatusModel(Base):
+    """Per-snapshot, per-stage status tracking for the intelligence pipeline.
+
+    Records whether each stage completed successfully, failed, or was skipped.
+    Enables retry of failed stages and monitoring of pipeline health.
+    """
+    __tablename__ = "intelligence_pipeline_status"
+    __table_args__ = (
+        UniqueConstraint("snapshot_id", "stage", name="uq_pipeline_status_snapshot_stage"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    snapshot_id = Column(String(36), ForeignKey("snapshots.id", ondelete="CASCADE"), nullable=False)
+    stage = Column(String(30), nullable=False)  # clustering, campaign_detection, phishkit_detection, c2_detection, actor_profiling
+    status = Column(String(20), nullable=False)  # done, error, skipped
+    error_message = Column(Text, nullable=True)
+    started_at = Column(DateTime, nullable=True)
+    completed_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=utc_now, nullable=False)
 
 
 # ---------------------------------------------------------------------------

@@ -1,7 +1,7 @@
 """add unique constraint on phishkits.signature_hash
 
 Revision ID: 005_phishkit_unique_constraint
-Revises: 004_intelligence_unique_constraints
+Revises: 005_clustering_watermark
 Create Date: 2026-05-02
 """
 
@@ -9,7 +9,7 @@ from alembic import op
 
 
 revision = "005_phishkit_unique_constraint"
-down_revision = "004_intelligence_unique_constraints"
+down_revision = "005_clustering_watermark"
 branch_labels = None
 depends_on = None
 

@@ -69,6 +69,17 @@ async def lifespan(app: FastAPI):
     else:
         init_db()
     seed_weights()
+
+    # Start periodic background schedulers
+    from worker import start_periodic_reconciliation, start_periodic_c2_ranking, start_periodic_actor_profiling
+    from worker import start_periodic_batch_clustering, start_periodic_batch_campaign, start_periodic_batch_phishkit
+    start_periodic_reconciliation()
+    start_periodic_c2_ranking()
+    start_periodic_actor_profiling()
+    start_periodic_batch_clustering()
+    start_periodic_batch_campaign()
+    start_periodic_batch_phishkit()
+
     yield
 
 

@@ -9,6 +9,7 @@ from __future__ import annotations
 import logging
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
+from urllib.parse import urlparse
 
 logger = logging.getLogger(__name__)
 
@@ -32,7 +33,11 @@ C2_WINDOW_DAYS = 30
 
 # Maximum number of IOC candidates to load for C2 ranking.
 # Caps memory usage at scale by prioritizing most-recently-seen IOCs.
-MAX_C2_IOC_CANDIDATES = 5000
+MAX_C2_IOC_CANDIDATES = 2000
+
+# Confidence decay: IOCs not seen within this many days get a decay multiplier.
+C2_DECAY_THRESHOLD_DAYS = 14
+C2_DECAY_MULTIPLIER = 0.7
 
 
 # ---------------------------------------------------------------------------
@@ -40,18 +45,42 @@ MAX_C2_IOC_CANDIDATES = 5000
 # ---------------------------------------------------------------------------
 
 
+_LEGITIMATE_LOGIN_DOMAINS = (
+    "login.microsoftonline.com",
+    "login.salesforce.com",
+    "accounts.google.com",
+    "signin.aws.amazon.com",
+    "auth0.com",
+    "okta.com",
+    "onelogin.com",
+    "pingidentity.com",
+    "login.live.com",
+    "login.yahoo.com",
+    "login.apple.com",
+    "login.twitter.com",
+    "login.linkedin.com",
+)
+
+
 def _is_post_form_target(ioc_value: str, ioc_type: str) -> bool:
     """Check if a URL IOC looks like a POST/form submission target.
 
     Matches common phishing exfiltration URL patterns (login, submit, post,
-    api endpoints, form handlers).
+    api endpoints, form handlers).  Known legitimate login/SSO domains are
+    excluded to avoid false positives.
     """
     if ioc_type != "url":
         return False
     lower = ioc_value.lower()
+
+    parsed = urlparse(ioc_value)
+    hostname = (parsed.hostname or "").lower()
+    if any(hostname == domain or hostname.endswith("." + domain) for domain in _LEGITIMATE_LOGIN_DOMAINS):
+        return False
+
     indicators = (
-        "post", "submit", "login", "form", "upload", "send",
-        "api/login", "api/submit", "capture", "collect", "exfil",
+        "post", "submit", "upload", "api/send",
+        "api/login", "api/submit", "capture", "exfil",
     )
     return any(sig in lower for sig in indicators)
 
@@ -226,6 +255,11 @@ def rank_c2_candidates(session, snapshot_id: str | None = None) -> list[dict]:
         if ioc_roles.get(ioc.id) == "exfil_endpoint":
             score += SCORE_RECEIVES_POST
             signals.append("receives_post_data")
+
+        # Apply confidence decay for stale IOCs (H-3)
+        if ioc.last_seen and (cutoff - ioc.last_seen).days > C2_DECAY_THRESHOLD_DAYS:
+            score *= C2_DECAY_MULTIPLIER
+            signals.append("decayed")
 
         # Only include IOCs with at least one signal.
         if score > 0.0:
