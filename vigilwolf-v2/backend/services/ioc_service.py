@@ -57,6 +57,19 @@ def _normalize_ioc_value(ioc_type: str, value: str) -> str:
     if ioc_type == "telegram":
         # Strip leading @ and lowercase
         return value.lstrip("@").lower()
+    if ioc_type == "phone":
+        digits = re.sub(r"\D", "", value)
+        if not digits:
+            return value
+        if len(digits) == 11 and digits.startswith("1"):
+            return f"+{digits}"
+        if len(digits) == 10:
+            return f"+1{digits}"
+        return f"+{digits}"
+    if ioc_type == "wallet":
+        if value.startswith("0x") or value.startswith("0X"):
+            return value.lower()
+        return value
     return value
 
 # ---------------------------------------------------------------------------
@@ -144,12 +157,31 @@ def _classify_url_role(url: str) -> str:
     if any(hostname == domain or hostname.endswith("." + domain) for domain in _LEGITIMATE_LOGIN_DOMAINS):
         return "resource"
 
-    # Exfiltration endpoints: POST actions, form submissions
-    if any(sig in url_lower for sig in ("post", "submit", "upload", "send", "api/login", "api/submit", "capture", "collect", "exfil")):
+    # Exfiltration endpoints: POST actions, form submissions — checked BEFORE
+    # tracking so that phishing exfil URLs like /api/collect are not misclassified
+    # as tracking pixels.
+    if any(sig in url_lower for sig in ("post", "submit", "upload", "api/send", "api/login", "api/submit", "capture", "exfil")):
         return "exfil_endpoint"
 
-    # Tracking pixels / analytics
+    # Tracking pixels / analytics — after exfil check so that "collect" URLs
+    # are only classified as tracking when the domain matches known analytics providers.
+    _ANALYTICS_DOMAINS = (
+        "google-analytics.com", "googletagmanager.com", "doubleclick.net",
+        "facebook.com", "hotjar.com", "mixpanel.com", "segment.com",
+    )
     if any(kw in url_lower for kw in _TRACKING_PIXEL_KEYWORDS):
+        # "collect" is ambiguous — only classify as tracking if the domain
+        # matches a known analytics provider. Otherwise it may be a phishing
+        # exfil endpoint that happens to use "collect" in its path.
+        if "collect" in url_lower:
+            if any(hostname == ad or hostname.endswith("." + ad) for ad in _ANALYTICS_DOMAINS):
+                return "tracking"
+            # "collect" on a non-analytics domain is more likely exfil;
+            # it was already caught by the exfil check above unless it's
+            # a standalone "collect" without other exfil indicators.
+            # Re-check as exfil if the path contains it.
+            if "/collect" in url_lower:
+                return "exfil_endpoint"
         return "tracking"
 
     # CDN / static asset hosts (parsed/hostname already computed above)
@@ -374,10 +406,18 @@ def persist_iocs(
                 )
 
     # script_load: script src URLs are linked to the domain they are loaded on
+    # Batch-load all IOCs for this snapshot in a single query (N+1 fix)
+    ioc_rows = (
+        session.query(IocModel)
+        .filter(IocModel.id.in_(snapshot_ioc_ids))
+        .all()
+    ) if snapshot_ioc_ids else []
+    ioc_by_id = {ioc.id: ioc for ioc in ioc_rows}
+
     url_ioc_ids = []
     domain_ioc_ids = []
     for ioc_id in snapshot_ioc_ids:
-        ioc = session.query(IocModel).get(ioc_id)
+        ioc = ioc_by_id.get(ioc_id)
         if ioc is None:
             continue
         if ioc.type == "url" and _is_script_src_url(ioc.value):
@@ -386,7 +426,7 @@ def persist_iocs(
             domain_ioc_ids.append(ioc_id)
 
     for url_id in url_ioc_ids:
-        url_ioc = session.query(IocModel).get(url_id)
+        url_ioc = ioc_by_id.get(url_id)
         if url_ioc is None:
             continue
         parsed = urlparse(url_ioc.value)
@@ -395,7 +435,7 @@ def persist_iocs(
             continue
 
         for domain_id in domain_ioc_ids:
-            domain_ioc = session.query(IocModel).get(domain_id)
+            domain_ioc = ioc_by_id.get(domain_id)
             if domain_ioc is None:
                 continue
             if domain_ioc.value.lower() == domain_host:
@@ -538,10 +578,10 @@ def get_ioc_details(
         .all()
     )
 
-    related_iocs = []
+    # Collect unique related IOC IDs and map relationship info
     seen_ioc_ids = set()
+    rel_info: list[tuple[int, str, float]] = []  # (other_ioc_id, relationship_type, confidence)
     for rel in rel_rows:
-        # Determine the "other" IOC in this relationship
         if rel.source_ioc_id == ioc_id:
             other_id = rel.target_ioc_id
         else:
@@ -550,18 +590,28 @@ def get_ioc_details(
         if other_id in seen_ioc_ids:
             continue
         seen_ioc_ids.add(other_id)
+        rel_info.append((other_id, rel.relationship_type, rel.confidence))
 
-        other_ioc = session.query(IocModel).get(other_id)
-        if other_ioc is None:
-            continue
-
-        related_iocs.append({
-            "id": other_ioc.id,
-            "type": other_ioc.type,
-            "value": other_ioc.value,
-            "relationship_type": rel.relationship_type,
-            "confidence": rel.confidence,
-        })
+    # Batch-load all related IOCs in a single query
+    related_iocs = []
+    if seen_ioc_ids:
+        other_iocs = (
+            session.query(IocModel)
+            .filter(IocModel.id.in_(seen_ioc_ids))
+            .all()
+        )
+        other_by_id = {ioc.id: ioc for ioc in other_iocs}
+        for other_id, rel_type, confidence in rel_info:
+            other_ioc = other_by_id.get(other_id)
+            if other_ioc is None:
+                continue
+            related_iocs.append({
+                "id": other_ioc.id,
+                "type": other_ioc.type,
+                "value": other_ioc.value,
+                "relationship_type": rel_type,
+                "confidence": confidence,
+            })
 
     return {
         "id": ioc.id,

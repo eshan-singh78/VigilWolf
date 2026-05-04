@@ -132,3 +132,29 @@ def test_ioc_extractor_type_is_extraction():
     ctx = _make_ctx(text="test")
     result = plugin.run(ctx)
     assert result.plugin_type == PluginType.EXTRACTION
+
+
+# --- Phone and wallet normalization tests (D-3) ---
+
+from services.ioc_service import _normalize_ioc_value
+
+
+def test_phone_normalization_with_country_code():
+    assert _normalize_ioc_value("phone", "+1-555-123-4567") == "+15551234567"
+
+
+def test_phone_normalization_without_country_code():
+    assert _normalize_ioc_value("phone", "5551234567") == "+15551234567"
+
+
+def test_phone_normalization_international():
+    assert _normalize_ioc_value("phone", "+44 20 7946 0958") == "+442079460958"
+
+
+def test_wallet_normalization_evm_lowercase():
+    assert _normalize_ioc_value("wallet", "0xDeadBeef00000000000000000000000000000000") == "0xdeadbeef00000000000000000000000000000000"
+
+
+def test_wallet_normalization_bitcoin_preserved():
+    btc = "1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa"
+    assert _normalize_ioc_value("wallet", btc) == btc
