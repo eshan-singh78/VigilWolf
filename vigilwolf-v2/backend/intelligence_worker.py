@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import logging
 import time as _time
+from datetime import datetime, timezone
 from typing import Any, Optional
 
 import config
@@ -43,6 +44,76 @@ def _get_intelligence_actor():
 
     _intelligence_actor = run_intelligence_pipeline_actor
     return _intelligence_actor
+
+
+# ---------------------------------------------------------------------------
+# Stage status helpers
+# ---------------------------------------------------------------------------
+
+
+def _record_stage_status(
+    snapshot_id: str,
+    stage: str,
+    status: str,
+    error_message: str | None = None,
+) -> None:
+    """Record or update the intelligence pipeline stage status for a snapshot.
+
+    Uses ``session.merge()`` so that retries and re-runs update the existing
+    row rather than failing on the unique constraint.
+    """
+    from database import get_session, IntelligencePipelineStatusModel  # type: ignore[import-untyped]
+
+    with get_session() as session:
+        row = IntelligencePipelineStatusModel(
+            snapshot_id=snapshot_id,
+            stage=stage,
+            status=status,
+            started_at=datetime.now(timezone.utc) if status in ("running", "queued") else None,
+            completed_at=datetime.now(timezone.utc) if status in ("done", "failed") else None,
+            error_message=error_message,
+        )
+        # Find existing row to preserve started_at if transitioning to done/failed
+        existing = (
+            session.query(IntelligencePipelineStatusModel)
+            .filter_by(snapshot_id=snapshot_id, stage=stage)
+            .first()
+        )
+        if existing:
+            existing.status = status
+            if status == "running" and not existing.started_at:
+                existing.started_at = datetime.now(timezone.utc)
+            if status in ("done", "failed"):
+                existing.completed_at = datetime.now(timezone.utc)
+            if error_message:
+                existing.error_message = error_message
+        else:
+            # Adjust timestamps based on status
+            if status == "running":
+                row.started_at = datetime.now(timezone.utc)
+                row.completed_at = None
+            elif status in ("done", "failed"):
+                row.started_at = datetime.now(timezone.utc)
+                row.completed_at = datetime.now(timezone.utc)
+            session.add(row)
+        session.commit()
+
+
+def _stage_already_done(snapshot_id: str, stage: str) -> bool:
+    """Check if an intelligence pipeline stage has already completed for this snapshot.
+
+    Returns True if a row exists with status ``done``, meaning the stage
+    should be skipped for idempotency.
+    """
+    from database import get_session, IntelligencePipelineStatusModel  # type: ignore[import-untyped]
+
+    with get_session() as session:
+        existing = (
+            session.query(IntelligencePipelineStatusModel)
+            .filter_by(snapshot_id=snapshot_id, stage=stage, status="done")
+            .first()
+        )
+        return existing is not None
 
 
 # ---------------------------------------------------------------------------
@@ -78,67 +149,68 @@ def run_intelligence_pipeline(snapshot_id: str) -> Optional[dict]:
         )
         return None
 
+    # C-3: Mark the overall pipeline as "running" so dedup guards in
+    # orchestrate_analysis can detect in-flight pipelines.
+    _record_stage_status(snapshot_id, "pipeline", "running")
+
     _start = _time.time()
     results: dict[str, Any] = {
         "snapshot_id": snapshot_id,
         "stages": {},
     }
 
-    # Reconcile orphaned plugin statuses from crashed pipelines
-    try:
-        from database import get_session  # type: ignore[import-untyped]
-        from services.reconciliation_service import reconcile_orphaned_statuses  # type: ignore[import-untyped]
-
-        with get_session() as recon_session:
-            recon_result = reconcile_orphaned_statuses(recon_session)
-            recon_session.commit()
-        if recon_result.get("reconciled_running", 0) > 0 or recon_result.get("reconciled_pending", 0) > 0:
-            logger.info(
-                "Reconciled orphaned statuses: %s", recon_result,
-            )
-    except Exception:
-        logger.exception("Failed to reconcile orphaned plugin statuses")
-
     logger.info("Starting intelligence pipeline for snapshot_id=%s", snapshot_id)
 
     # --- Stage 1: Clustering ---
     if config.CLUSTERING_ENABLED:
-        try:
-            from services.clustering_service import cluster_snapshot  # type: ignore[import-untyped]
+        if _stage_already_done(snapshot_id, "clustering"):
+            logger.info("Clustering already done for snapshot_id=%s; skipping.", snapshot_id)
+        else:
+            try:
+                _record_stage_status(snapshot_id, "clustering", "running")
+                from services.clustering_service import cluster_snapshot  # type: ignore[import-untyped]
 
-            cluster_count = cluster_snapshot(snapshot_id)
-            results["stages"]["clustering"] = {"clusters_created_or_updated": cluster_count}
+                cluster_count = cluster_snapshot(snapshot_id)
+                results["stages"]["clustering"] = {"clusters_created_or_updated": cluster_count}
+                _record_stage_status(snapshot_id, "clustering", "done")
 
-            logger.info(
-                "Clustering complete for snapshot_id=%s: %d clusters created/updated",
-                snapshot_id, cluster_count,
-            )
-        except Exception:
-            logger.exception(
-                "Clustering failed for snapshot_id=%s; continuing.", snapshot_id,
-            )
-            results["stages"]["clustering"] = {"error": True}
+                logger.info(
+                    "Clustering complete for snapshot_id=%s: %d clusters created/updated",
+                    snapshot_id, cluster_count,
+                )
+            except Exception:
+                logger.exception(
+                    "Clustering failed for snapshot_id=%s; continuing.", snapshot_id,
+                )
+                results["stages"]["clustering"] = {"error": True}
+                _record_stage_status(snapshot_id, "clustering", "failed", error_message="Clustering stage failed")
     else:
         logger.debug("Clustering disabled; skipping for snapshot_id=%s", snapshot_id)
 
     # --- Stage 2: Campaign detection ---
     if config.CAMPAIGN_DETECTION_ENABLED:
-        try:
-            from services.campaign_service import detect_campaigns_for_snapshot  # type: ignore[import-untyped]
+        if _stage_already_done(snapshot_id, "campaign_detection"):
+            logger.info("Campaign detection already done for snapshot_id=%s; skipping.", snapshot_id)
+        else:
+            try:
+                _record_stage_status(snapshot_id, "campaign_detection", "running")
+                from services.campaign_service import detect_campaigns_for_snapshot  # type: ignore[import-untyped]
 
-            campaign_count = detect_campaigns_for_snapshot(snapshot_id)
-            results["stages"]["campaign_detection"] = {"campaigns_created_or_updated": campaign_count}
+                campaign_count = detect_campaigns_for_snapshot(snapshot_id)
+                results["stages"]["campaign_detection"] = {"campaigns_created_or_updated": campaign_count}
+                _record_stage_status(snapshot_id, "campaign_detection", "done")
 
-            logger.info(
-                "Campaign detection complete for snapshot_id=%s: %d campaigns created/updated",
-                snapshot_id, campaign_count,
-            )
-        except Exception:
-            logger.exception(
-                "Campaign detection failed for snapshot_id=%s; continuing.",
-                snapshot_id,
-            )
-            results["stages"]["campaign_detection"] = {"error": True}
+                logger.info(
+                    "Campaign detection complete for snapshot_id=%s: %d campaigns created/updated",
+                    snapshot_id, campaign_count,
+                )
+            except Exception:
+                logger.exception(
+                    "Campaign detection failed for snapshot_id=%s; continuing.",
+                    snapshot_id,
+                )
+                results["stages"]["campaign_detection"] = {"error": True}
+                _record_stage_status(snapshot_id, "campaign_detection", "failed", error_message="Campaign detection stage failed")
     else:
         logger.debug(
             "Campaign detection disabled; skipping for snapshot_id=%s", snapshot_id,
@@ -146,22 +218,28 @@ def run_intelligence_pipeline(snapshot_id: str) -> Optional[dict]:
 
     # --- Stage 3: PhishKit detection ---
     if config.PHISHKIT_DETECTION_ENABLED:
-        try:
-            from services.phishkit_service import detect_phishkits_for_snapshot  # type: ignore[import-untyped]
+        if _stage_already_done(snapshot_id, "phishkit_detection"):
+            logger.info("PhishKit detection already done for snapshot_id=%s; skipping.", snapshot_id)
+        else:
+            try:
+                _record_stage_status(snapshot_id, "phishkit_detection", "running")
+                from services.phishkit_service import detect_phishkits_for_snapshot  # type: ignore[import-untyped]
 
-            phishkit_count = detect_phishkits_for_snapshot(snapshot_id)
-            results["stages"]["phishkit_detection"] = {"phishkits_created_or_updated": phishkit_count}
+                phishkit_count = detect_phishkits_for_snapshot(snapshot_id)
+                results["stages"]["phishkit_detection"] = {"phishkits_created_or_updated": phishkit_count}
+                _record_stage_status(snapshot_id, "phishkit_detection", "done")
 
-            logger.info(
-                "PhishKit detection complete for snapshot_id=%s: %d phishkits created/updated",
-                snapshot_id, phishkit_count,
-            )
-        except Exception:
-            logger.exception(
-                "PhishKit detection failed for snapshot_id=%s; continuing.",
-                snapshot_id,
-            )
-            results["stages"]["phishkit_detection"] = {"error": True}
+                logger.info(
+                    "PhishKit detection complete for snapshot_id=%s: %d phishkits created/updated",
+                    snapshot_id, phishkit_count,
+                )
+            except Exception:
+                logger.exception(
+                    "PhishKit detection failed for snapshot_id=%s; continuing.",
+                    snapshot_id,
+                )
+                results["stages"]["phishkit_detection"] = {"error": True}
+                _record_stage_status(snapshot_id, "phishkit_detection", "failed", error_message="PhishKit detection stage failed")
     else:
         logger.debug(
             "PhishKit detection disabled; skipping for snapshot_id=%s", snapshot_id,
@@ -169,54 +247,69 @@ def run_intelligence_pipeline(snapshot_id: str) -> Optional[dict]:
 
     # --- Stage 4: C2 detection ---
     if config.C2_DETECTION_ENABLED:
-        try:
-            from database import get_session, C2CandidateModel  # type: ignore[import-untyped]
-            from services.c2_service import rank_c2_candidates  # type: ignore[import-untyped]
+        if _stage_already_done(snapshot_id, "c2_detection"):
+            logger.info("C2 detection already done for snapshot_id=%s; skipping.", snapshot_id)
+        else:
+            try:
+                _record_stage_status(snapshot_id, "c2_detection", "running")
+                from database import get_session, C2CandidateModel  # type: ignore[import-untyped]
+                from sqlalchemy.exc import IntegrityError
+                from services.c2_service import rank_c2_candidates  # type: ignore[import-untyped]
 
-            with get_session() as session:
-                c2_result = rank_c2_candidates(session, snapshot_id=snapshot_id)
-                if c2_result:
-                    for candidate in c2_result:
-                        try:
-                            with session.begin_nested():
-                                # Check if this IOC already has a C2 candidate
-                                existing = (
-                                    session.query(C2CandidateModel)
-                                    .filter(C2CandidateModel.ioc_id == candidate["ioc_id"])
-                                    .first()
+                with get_session() as session:
+                    c2_result = rank_c2_candidates(session, snapshot_id=snapshot_id)
+                    if c2_result:
+                        for candidate in c2_result:
+                            try:
+                                with session.begin_nested():
+                                    # Check if this IOC already has a C2 candidate
+                                    existing = (
+                                        session.query(C2CandidateModel)
+                                        .filter(C2CandidateModel.ioc_id == candidate["ioc_id"])
+                                        .first()
+                                    )
+                                    if existing:
+                                        # Update score if new score is higher
+                                        if candidate["c2_score"] > existing.c2_score:
+                                            existing.c2_score = candidate["c2_score"]
+                                            existing.signals = candidate.get("signals", [])
+                                            existing.snapshot_id = snapshot_id
+                                        continue
+                                    c2_row = C2CandidateModel(
+                                        ioc_id=candidate["ioc_id"],
+                                        snapshot_id=snapshot_id,
+                                        c2_score=candidate["c2_score"],
+                                        signals=candidate.get("signals", []),
+                                    )
+                                    session.add(c2_row)
+                                    session.flush()
+                            except IntegrityError:
+                                logger.debug("C2 candidate already exists for ioc_id=%d", candidate["ioc_id"])
+                            except Exception:
+                                logger.error(
+                                    "Unexpected error inserting C2 candidate for ioc_id=%d",
+                                    candidate["ioc_id"],
+                                    exc_info=True,
                                 )
-                                if existing:
-                                    # Update score if new score is higher
-                                    if candidate["c2_score"] > existing.c2_score:
-                                        existing.c2_score = candidate["c2_score"]
-                                        existing.signals = candidate.get("signals", [])
-                                        existing.snapshot_id = snapshot_id
-                                    continue
-                                c2_row = C2CandidateModel(
-                                    ioc_id=candidate["ioc_id"],
-                                    snapshot_id=snapshot_id,
-                                    c2_score=candidate["c2_score"],
-                                    signals=candidate.get("signals", []),
-                                )
-                                session.add(c2_row)
-                                session.flush()
-                        except Exception:
-                            logger.debug("C2 candidate already exists for ioc_id=%d", candidate["ioc_id"])
-                    session.commit()
-            results["stages"]["c2_detection"] = {
-                "candidates_found": len(c2_result) if c2_result else 0,
-            }
+                                results["stages"]["c2_detection"] = {"error": True}
+                        session.commit()
+                if "c2_detection" not in results["stages"] or not results["stages"]["c2_detection"].get("error"):
+                    results["stages"]["c2_detection"] = {
+                        "candidates_found": len(c2_result) if c2_result else 0,
+                    }
+                _record_stage_status(snapshot_id, "c2_detection", "done")
 
-            logger.info(
-                "C2 detection complete for snapshot_id=%s: %d candidates",
-                snapshot_id, len(c2_result) if c2_result else 0,
-            )
-        except Exception:
-            logger.exception(
-                "C2 detection failed for snapshot_id=%s; continuing.",
-                snapshot_id,
-            )
-            results["stages"]["c2_detection"] = {"error": True}
+                logger.info(
+                    "C2 detection complete for snapshot_id=%s: %d candidates",
+                    snapshot_id, len(c2_result) if c2_result else 0,
+                )
+            except Exception:
+                logger.exception(
+                    "C2 detection failed for snapshot_id=%s; continuing.",
+                    snapshot_id,
+                )
+                results["stages"]["c2_detection"] = {"error": True}
+                _record_stage_status(snapshot_id, "c2_detection", "failed", error_message="C2 detection stage failed")
     else:
         logger.debug(
             "C2 detection disabled; skipping for snapshot_id=%s", snapshot_id,
@@ -224,25 +317,31 @@ def run_intelligence_pipeline(snapshot_id: str) -> Optional[dict]:
 
     # --- Stage 5: Actor profiling ---
     if config.ACTOR_PROFILING_ENABLED:
-        try:
-            from database import get_session  # type: ignore[import-untyped]
-            from services.actor_service import profile_actors  # type: ignore[import-untyped]
+        if _stage_already_done(snapshot_id, "actor_profiling"):
+            logger.info("Actor profiling already done for snapshot_id=%s; skipping.", snapshot_id)
+        else:
+            try:
+                _record_stage_status(snapshot_id, "actor_profiling", "running")
+                from database import get_session  # type: ignore[import-untyped]
+                from services.actor_service import profile_actors  # type: ignore[import-untyped]
 
-            with get_session() as session:
-                actor_result = profile_actors(session)
-                session.commit()
-            results["stages"]["actor_profiling"] = actor_result
+                with get_session() as session:
+                    actor_result = profile_actors(session)
+                    session.commit()
+                results["stages"]["actor_profiling"] = actor_result
+                _record_stage_status(snapshot_id, "actor_profiling", "done")
 
-            logger.info(
-                "Actor profiling complete for snapshot_id=%s: %s",
-                snapshot_id, actor_result,
-            )
-        except Exception:
-            logger.exception(
-                "Actor profiling failed for snapshot_id=%s; continuing.",
-                snapshot_id,
-            )
-            results["stages"]["actor_profiling"] = {"error": True}
+                logger.info(
+                    "Actor profiling complete for snapshot_id=%s: %s",
+                    snapshot_id, actor_result,
+                )
+            except Exception:
+                logger.exception(
+                    "Actor profiling failed for snapshot_id=%s; continuing.",
+                    snapshot_id,
+                )
+                results["stages"]["actor_profiling"] = {"error": True}
+                _record_stage_status(snapshot_id, "actor_profiling", "failed", error_message="Actor profiling stage failed")
     else:
         logger.debug(
             "Actor profiling disabled; skipping for snapshot_id=%s", snapshot_id,
@@ -250,6 +349,9 @@ def run_intelligence_pipeline(snapshot_id: str) -> Optional[dict]:
 
     elapsed = _time.time() - _start
     results["elapsed_s"] = round(elapsed, 4)
+
+    # Mark overall pipeline as done
+    _record_stage_status(snapshot_id, "pipeline", "done")
 
     logger.info(
         "Intelligence pipeline finished for snapshot_id=%s in %.2fs (stages: %s)",
