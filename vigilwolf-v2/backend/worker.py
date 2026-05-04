@@ -1086,23 +1086,34 @@ def orchestrate_analysis(ctx: SnapshotContext) -> None:
                     elif result.plugin_name == "dns_enricher" and result.findings:
                         ctx.metadata["dns_records"] = result.findings
 
-                    # Store AnalysisResultModel
+                    # Store AnalysisResultModel (idempotent on retry)
                     with get_session() as session:
-                        analysis_row = AnalysisResultModel(
-                            snapshot_id=ctx.snapshot_id,
-                            plugin_name=result.plugin_name,
-                            plugin_version=result.plugin_version,
-                            plugin_type=result.plugin_type.value,
-                            result_json={
-                                "tags": result.tags,
-                                "findings": result.findings,
-                                "error": result.error,
-                            },
-                            score_contribution=result.score_contribution,
-                            confidence=result.confidence,
-                            tags=result.tags,
+                        existing_result = (
+                            session.query(AnalysisResultModel)
+                            .filter_by(snapshot_id=ctx.snapshot_id, plugin_name=result.plugin_name)
+                            .first()
                         )
-                        session.add(analysis_row)
+                        if existing_result is not None:
+                            logger.debug(
+                                "AnalysisResultModel already exists for snapshot_id=%s plugin=%s; skipping insert",
+                                ctx.snapshot_id, result.plugin_name,
+                            )
+                        else:
+                            analysis_row = AnalysisResultModel(
+                                snapshot_id=ctx.snapshot_id,
+                                plugin_name=result.plugin_name,
+                                plugin_version=result.plugin_version,
+                                plugin_type=result.plugin_type.value,
+                                result_json={
+                                    "tags": result.tags,
+                                    "findings": result.findings,
+                                    "error": result.error,
+                                },
+                                score_contribution=result.score_contribution,
+                                confidence=result.confidence,
+                                tags=result.tags,
+                            )
+                            session.add(analysis_row)
                         session.commit()
 
                     # Update status -> done
