@@ -37,6 +37,10 @@ LIKELY_SAME_THRESHOLD = 0.8
 INFRA_CONFIDENCE_THRESHOLD = 0.7
 MIN_INFRA_OVERLAP_COUNT = 3
 
+# S-2: Memory optimization limits
+MAX_DOMAINS_PER_CAMPAIGN_PROFILE = 500
+MAX_TOTAL_DOMAINS_WARNING = 25000
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -316,11 +320,26 @@ def profile_actors(session) -> dict:
         for cluster_id in cluster_ids:
             relevant_domain_ids.update(cluster_domain_map.get(cluster_id, set()))
 
-    # Pre-load domain -> snapshot mappings (filtered to relevant domains only)
+    total_domain_count = sum(len(dids) for dids in cluster_domain_map.values() if dids)
+    if total_domain_count > MAX_TOTAL_DOMAINS_WARNING:
+        logger.warning(
+            "profile_actors: %d total domains across campaigns exceeds %d; "
+            "consider reducing CAMPAIGN_WINDOW_DAYS",
+            total_domain_count, MAX_TOTAL_DOMAINS_WARNING,
+        )
+
+    # Pre-load domain -> snapshot mappings (S-2: only latest snapshot per domain)
     domain_snapshot_map: dict[str, set[str]] = {}
     if relevant_domain_ids:
+        from sqlalchemy import func as sa_func
+        latest_snapshot_ids = (
+            session.query(sa_func.max(SnapshotModel.id))
+            .filter(SnapshotModel.domain_id.in_(relevant_domain_ids))
+            .group_by(SnapshotModel.domain_id)
+            .all()
+        )
         filtered_snapshots = session.query(SnapshotModel).filter(
-            SnapshotModel.domain_id.in_(relevant_domain_ids)
+            SnapshotModel.id.in_([sid for (sid,) in latest_snapshot_ids])
         ).all()
         for s in filtered_snapshots:
             domain_snapshot_map.setdefault(s.domain_id, set()).add(s.id)
@@ -335,7 +354,7 @@ def profile_actors(session) -> dict:
     if relevant_snapshot_ids:
         filtered_occurrences = session.query(IocOccurrenceModel).filter(
             IocOccurrenceModel.snapshot_id.in_(relevant_snapshot_ids)
-        ).all()
+        ).yield_per(500).all()
         for occ in filtered_occurrences:
             snapshot_ioc_map.setdefault(occ.snapshot_id, set()).add(occ.ioc_id)
 
