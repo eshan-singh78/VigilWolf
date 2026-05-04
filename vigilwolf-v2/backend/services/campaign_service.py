@@ -33,7 +33,7 @@ CAMPAIGN_RECHECK_INTERVAL_HOURS = 24
 _BRAND_DENYLIST = {
     "google", "cloudflare", "akamai", "amazon", "aws", "azure",
     "microsoft", "apple", "github", "gitlab", "docker",
-    "icloud",
+    "icloud", "bofa",
     "npm", "jsdelivr", "unpkg", "cdnjs",
     "go", "me", "it", "be", "at", "us", "uk", "de", "fr",
     "my", "tv", "io", "ai", "co",
@@ -41,6 +41,13 @@ _BRAND_DENYLIST = {
 
 # Minimum keyword length — keywords shorter than 4 chars match too broadly.
 _BRAND_MIN_LENGTH = 4
+
+# Short brand keywords that bypass _BRAND_MIN_LENGTH (H-1).
+_SHORT_BRAND_ALLOWLIST = {
+    "dhl": "DHL",
+    "ups": "UPS",
+    "pnc": "PNC",
+}
 
 # Known legitimate infrastructure domains that must never be used for brand
 # detection.  These are real domains owned by the brands they reference, so
@@ -77,7 +84,6 @@ BRAND_KEYWORDS: list[tuple[str, str]] = [
     ("wellsfargo", "WELLSFARGO"),
     ("chase", "CHASE"),
     ("bankofamerica", "BANKOFAMERICA"),
-    ("bofa", "BANKOFAMERICA"),
     ("citibank", "CITIBANK"),
     ("citi", "CITIBANK"),
     ("usbank", "USBANK"),
@@ -166,7 +172,9 @@ def _detect_brand(domain_urls: list[str]) -> Optional[str]:
     combined = " ".join(hostnames)
     for keyword, brand in BRAND_KEYWORDS:
         # Skip short keywords and denylisted terms to reduce false positives.
-        if len(keyword) < _BRAND_MIN_LENGTH or keyword.lower() in _BRAND_DENYLIST:
+        if len(keyword) < _BRAND_MIN_LENGTH and keyword.lower() not in _SHORT_BRAND_ALLOWLIST:
+            continue
+        if keyword.lower() in _BRAND_DENYLIST:
             continue
         # Match keyword as a word boundary within hostname parts.
         # Hostnames use dots as separators, so match between dots/dashes.
@@ -177,22 +185,27 @@ def _detect_brand(domain_urls: list[str]) -> Optional[str]:
     return None
 
 
-def _generate_campaign_name(brand: str) -> str:
-    """Auto-generate a campaign name in the format BRAND_PHISH_YYYYWNN.
+def _generate_campaign_name(brand: str, signature_hash: str | None = None) -> str:
+    """Auto-generate a campaign name in the format BRAND_PHISH_YYYYWNN_sig8.
 
-    Uses the ISO week number for the date suffix, so campaigns targeting the
-    same brand within the same week share a name base (the uniqueness loop
-    appends _1, _2 etc. if needed).
+    Uses the ISO week number for the date suffix. When a signature hash is
+    provided, appends its first 8 characters to make the name unique per
+    phishkit. When no signature is available, appends a short UUID fragment
+    to avoid collisions.
 
     Args:
         brand: Uppercased brand label.
+        signature_hash: Optional cluster signature hash for disambiguation.
 
     Returns:
-        Campaign name string, e.g. "PAYPAL_PHISH_2026W18".
+        Campaign name string, e.g. "PAYPAL_PHISH_2026W18_a3f2c1d5".
     """
     now = datetime.now(timezone.utc)
     iso_year, iso_week, _ = now.isocalendar()
-    return f"{brand}_PHISH_{iso_year}W{iso_week:02d}"
+    base = f"{brand}_PHISH_{iso_year}W{iso_week:02d}"
+    if signature_hash:
+        return f"{base}_{signature_hash[:8]}"
+    return f"{base}_{uuid.uuid4().hex[:8]}"
 
 
 # ---------------------------------------------------------------------------
@@ -278,6 +291,14 @@ def detect_campaigns(session) -> dict:
     campaigns_updated = 0
 
     for cluster in clusters:
+        # Campaign detection only processes html_similarity clusters.
+        # This is a safety check — the query above should already filter,
+        # but defensive programming prevents accidental merge of infra
+        # clusters (which have different signature semantics).
+        if cluster.cluster_type != "html_similarity":
+            logger.warning("Skipping non-html_similarity cluster %s (type=%s)", cluster.id[:8], cluster.cluster_type)
+            continue
+
         # Check if this cluster is already linked to a campaign.
         existing_link = (
             session.query(CampaignClusterModel)
@@ -304,7 +325,14 @@ def detect_campaigns(session) -> dict:
 
             # Determine dormancy or re-activation.
             dormant_cutoff = datetime.now(timezone.utc) - timedelta(days=DORMANT_THRESHOLD_DAYS)
-            if cluster.last_seen < dormant_cutoff and campaign.status == "active":
+            # Only mark dormant if the campaign has existed long enough to
+            # have a meaningful dormancy window. A brand-new campaign whose
+            # cluster happens to be old should not go dormant immediately.
+            campaign_is_mature = (
+                campaign.first_seen is not None
+                and campaign.first_seen < dormant_cutoff
+            )
+            if cluster.last_seen < dormant_cutoff and campaign.status == "active" and campaign_is_mature:
                 campaign.status = "dormant"
                 logger.info(
                     "Campaign %s (%s) marked dormant — no new domains since %s",
@@ -325,6 +353,7 @@ def detect_campaigns(session) -> dict:
                 campaign.last_seen.isoformat() if campaign.last_seen else None,
                 campaign.status,
             )
+            cluster.last_campaign_check = datetime.now(timezone.utc)
         else:
             # New campaign needed — resolve brand from member domains.
             member_rows = (
@@ -351,41 +380,73 @@ def detect_campaigns(session) -> dict:
             )
 
             if existing_brand_campaign is not None:
-                # Link this cluster to the existing campaign instead of creating a new one.
-                try:
-                    with session.begin_nested():
-                        link = CampaignClusterModel(
-                            campaign_id=existing_brand_campaign.id,
-                            cluster_id=cluster.id,
+                # Only merge if we can verify that the cluster's signature
+                # aligns with the campaign's kit_signature.  If either
+                # signature is missing, we cannot confirm they are the same
+                # phishkit, so we create a separate campaign instead.
+                cluster_sig = cluster.signature_hash
+                campaign_sig = existing_brand_campaign.kit_signature
+                sig_mismatch = (
+                    cluster_sig is not None
+                    and campaign_sig is not None
+                    and cluster_sig != campaign_sig
+                )
+                sig_missing = cluster_sig is None or campaign_sig is None
+                if sig_mismatch or sig_missing:
+                    if sig_mismatch:
+                        logger.debug(
+                            "Cluster %s signature %s does not match campaign %s signature %s; "
+                            "creating separate campaign for brand %s",
+                            cluster.id[:8], cluster_sig[:12] if cluster_sig else "None",
+                            existing_brand_campaign.id[:8], campaign_sig[:12] if campaign_sig else "None",
+                            brand,
                         )
-                        session.add(link)
-                        session.flush()
-                except Exception:
+                    else:
+                        logger.info(
+                            "Cannot verify signature alignment for cluster %s against campaign %s "
+                            "(cluster_sig=%s, campaign_sig=%s); creating separate campaign for brand %s",
+                            cluster.id[:8], existing_brand_campaign.id[:8],
+                            cluster_sig, campaign_sig, brand,
+                        )
+                    # Fall through to create a new campaign below.
+                else:
+                    # Signatures match — safe to merge.
+                    try:
+                        with session.begin_nested():
+                            link = CampaignClusterModel(
+                                campaign_id=existing_brand_campaign.id,
+                                cluster_id=cluster.id,
+                            )
+                            session.add(link)
+                            session.flush()
+                    except Exception:
+                        logger.debug(
+                            "Cluster %s already linked to campaign %s",
+                            cluster.id[:8], existing_brand_campaign.id[:8],
+                        )
+                    _recompute_domain_count(existing_brand_campaign, session)
+                    existing_brand_campaign.last_seen = max(
+                        existing_brand_campaign.last_seen or datetime.now(timezone.utc),
+                        cluster.last_seen or datetime.now(timezone.utc),
+                    )
+                    # Re-activate if dormant
+                    if existing_brand_campaign.status == "dormant":
+                        existing_brand_campaign.status = "active"
+                        logger.info(
+                            "Re-activated campaign %s (%s) for brand %s with new cluster",
+                            existing_brand_campaign.id[:8], existing_brand_campaign.name, brand,
+                        )
+                    campaigns_updated += 1
                     logger.debug(
-                        "Cluster %s already linked to campaign %s",
-                        cluster.id[:8], existing_brand_campaign.id[:8],
+                        "Linked cluster %s to existing campaign %s (brand=%s)",
+                        cluster.id[:8], existing_brand_campaign.id[:8], brand,
                     )
-                _recompute_domain_count(existing_brand_campaign, session)
-                existing_brand_campaign.last_seen = max(
-                    existing_brand_campaign.last_seen or datetime.now(timezone.utc),
-                    cluster.last_seen or datetime.now(timezone.utc),
-                )
-                # Re-activate if dormant
-                if existing_brand_campaign.status == "dormant":
-                    existing_brand_campaign.status = "active"
-                    logger.info(
-                        "Re-activated campaign %s (%s) for brand %s with new cluster",
-                        existing_brand_campaign.id[:8], existing_brand_campaign.name, brand,
-                    )
-                campaigns_updated += 1
-                logger.debug(
-                    "Linked cluster %s to existing campaign %s (brand=%s)",
-                    cluster.id[:8], existing_brand_campaign.id[:8], brand,
-                )
-                cluster.last_campaign_check = datetime.now(timezone.utc)
-                continue
+                    cluster.last_campaign_check = datetime.now(timezone.utc)
+                    continue
 
-            campaign_name = _generate_campaign_name(brand)
+            # Either no existing brand campaign, or signature mismatch —
+            # create a new campaign for this cluster.
+            campaign_name = _generate_campaign_name(brand, cluster.signature_hash)
             campaign_id = str(uuid.uuid4())
             try:
                 with session.begin_nested():
@@ -431,6 +492,25 @@ def detect_campaigns(session) -> dict:
                         campaign_name,
                     )
                     continue
+
+                # Signature check: if the recovered campaign has a different
+                # kit_signature from this cluster, they are distinct campaigns
+                # and must NOT be merged.
+                if (
+                    cluster.signature_hash is not None
+                    and campaign.kit_signature is not None
+                    and cluster.signature_hash != campaign.kit_signature
+                ):
+                    logger.info(
+                        "Campaign %s (sig=%s) from IntegrityError does not match "
+                        "cluster %s (sig=%s); creating separate campaign.",
+                        campaign.id[:8],
+                        campaign.kit_signature[:12] if campaign.kit_signature else "None",
+                        cluster.id[:8],
+                        cluster.signature_hash[:12] if cluster.signature_hash else "None",
+                    )
+                    continue
+
                 # The campaign exists now — link the cluster to it.
                 try:
                     with session.begin_nested():
@@ -447,9 +527,7 @@ def detect_campaigns(session) -> dict:
                         "Cluster %s already linked to campaign %s",
                         cluster.id[:8], campaign.id[:8],
                     )
-
-    for cluster in clusters:
-        cluster.last_campaign_check = datetime.now(timezone.utc)
+                cluster.last_campaign_check = datetime.now(timezone.utc)
 
     session.flush()
     logger.info(
@@ -514,12 +592,14 @@ def detect_campaigns_for_snapshot(snapshot_id: str) -> int:
 # ---------------------------------------------------------------------------
 
 
-def get_campaigns(session, status: Optional[str] = None) -> list[dict]:
+def get_campaigns(session, status: Optional[str] = None, limit: int = 100, offset: int = 0) -> list[dict]:
     """List campaigns with optional status filter.
 
     Args:
         session: SQLAlchemy session.
         status: Optional status filter ("active", "dormant", "closed").
+        limit: Maximum number of results to return.
+        offset: Number of results to skip.
 
     Returns:
         List of campaign dicts sorted by last_seen descending.
@@ -532,7 +612,7 @@ def get_campaigns(session, status: Optional[str] = None) -> list[dict]:
     if status is not None:
         query = query.filter(CampaignModel.status == status)
 
-    campaigns = query.order_by(CampaignModel.last_seen.desc()).all()
+    campaigns = query.order_by(CampaignModel.last_seen.desc()).offset(offset).limit(limit).all()
 
     return [
         {
