@@ -270,9 +270,10 @@ def run_periodic_c2_ranking() -> dict:
                                 .first()
                             )
                             if existing:
-                                if candidate["c2_score"] > existing.c2_score:
-                                    existing.c2_score = candidate["c2_score"]
-                                    existing.signals = candidate.get("signals", [])
+                                # H-3: Unconditional update — decayed scores must be able
+                                # to go down, not just up.
+                                existing.c2_score = candidate["c2_score"]
+                                existing.signals = candidate.get("signals", [])
                             else:
                                 c2_row = C2CandidateModel(
                                     ioc_id=candidate["ioc_id"],
