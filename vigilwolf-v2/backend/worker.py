@@ -34,6 +34,8 @@ logger = logging.getLogger(__name__)
 # every RECONCILIATION_INTERVAL_S regardless of pipeline activity.
 # ---------------------------------------------------------------------------
 RECONCILIATION_INTERVAL_S = 15 * 60  # 15 minutes
+C2_RANKING_INTERVAL_S = 60 * 60  # 1 hour
+ACTOR_PROFILING_INTERVAL_S = 60 * 60  # 1 hour
 MAX_HTML_SIZE = 10 * 1024 * 1024  # 10 MB — reject HTML payloads larger than this
 
 
@@ -76,21 +78,30 @@ def _get_actors():
         return result
 
     @dramatiq.actor(broker=broker, max_retries=3, max_age=3600000, time_limit=300000)
-    def build_context_and_analyze_actor(snapshot_id: str, domain_id: str, url: str, html: str, snapshot_record: dict):
-        build_context_and_analyze(
-            snapshot_id=snapshot_id, domain_id=domain_id, url=url,
-            html=html, snapshot_record=snapshot_record,
-        )
+    def build_context_and_analyze_actor(snapshot_id: str, domain_id: str):
+        build_context_and_analyze(snapshot_id=snapshot_id, domain_id=domain_id)
 
     @dramatiq.actor(broker=broker, max_retries=1, max_age=3600000, time_limit=120000)
     def reconcile_orphaned_statuses():
         """Periodic task to clean up orphaned pipeline statuses."""
         run_periodic_reconciliation()
 
+    @dramatiq.actor(broker=broker, max_retries=1, max_age=3600000, time_limit=300000)
+    def rank_c2_candidates_periodic():
+        """Periodic task to rank C2 candidates across all snapshots."""
+        run_periodic_c2_ranking()
+
+    @dramatiq.actor(broker=broker, max_retries=1, max_age=3600000, time_limit=300000)
+    def profile_actors_periodic():
+        """Periodic task to profile threat actors across all campaigns."""
+        run_periodic_actor_profiling()
+
     _dramatiq_actors = {
         "capture_domain": capture_domain_actor,
         "build_context_and_analyze": build_context_and_analyze_actor,
         "reconcile_orphaned_statuses": reconcile_orphaned_statuses,
+        "rank_c2_candidates_periodic": rank_c2_candidates_periodic,
+        "profile_actors_periodic": profile_actors_periodic,
     }
     return _dramatiq_actors
 
@@ -115,10 +126,41 @@ def run_periodic_reconciliation() -> dict:
             session.commit()
 
         logger.info("Periodic reconciliation complete: %s", result)
-        return result
     except Exception:
         logger.exception("Periodic reconciliation failed")
-        return {"reconciled_running": 0, "reconciled_pending": 0, "error": True}
+        result = {"reconciled_running": 0, "reconciled_pending": 0, "error": True}
+
+    # IOC reconciliation — re-persist IOCs for snapshots that lost them.
+    ioc_result = {}
+    try:
+        from database import get_session
+        from services.reconciliation_service import reconcile_ioc_persistence
+
+        with get_session() as session:
+            ioc_result = reconcile_ioc_persistence(session)
+            session.commit()
+
+        logger.info("IOC reconciliation complete: %s", ioc_result)
+    except Exception:
+        logger.exception("IOC reconciliation failed")
+
+    # Missing pipeline reconciliation — re-trigger analysis for snapshots that never started.
+    pipeline_result = {}
+    try:
+        from database import get_session
+        from services.reconciliation_service import reconcile_missing_pipeline
+
+        with get_session() as session:
+            pipeline_result = reconcile_missing_pipeline(session)
+            # Note: reconcile_missing_pipeline calls build_context_and_analyze
+            # which manages its own session, so we commit the lookup session.
+            session.commit()
+
+        logger.info("Missing pipeline reconciliation complete: %s", pipeline_result)
+    except Exception:
+        logger.exception("Missing pipeline reconciliation failed")
+
+    return {**result, **ioc_result, **pipeline_result}
 
 
 _reconciliation_thread: Optional[_threading.Thread] = None
@@ -164,6 +206,162 @@ def start_periodic_reconciliation() -> None:
     logger.info(
         "Started periodic reconciliation scheduler (interval=%ds)", RECONCILIATION_INTERVAL_S,
     )
+
+
+# ---------------------------------------------------------------------------
+# Periodic C2 ranking (hourly batch, not per-snapshot)
+# ---------------------------------------------------------------------------
+
+def run_periodic_c2_ranking() -> dict:
+    """Synchronous C2 ranking runner — manages its own DB session.
+
+    Called by the Dramatiq actor and by the background scheduler thread.
+    Returns the ranking result dict for logging.
+    """
+    logger.info("Starting periodic C2 ranking")
+    try:
+        from database import get_session, C2CandidateModel  # type: ignore[import-untyped]
+        from services.c2_service import rank_c2_candidates  # type: ignore[import-untyped]
+
+        with get_session() as session:
+            c2_result = rank_c2_candidates(session)
+            if c2_result:
+                for candidate in c2_result:
+                    try:
+                        with session.begin_nested():
+                            existing = (
+                                session.query(C2CandidateModel)
+                                .filter(C2CandidateModel.ioc_id == candidate["ioc_id"])
+                                .first()
+                            )
+                            if existing:
+                                if candidate["c2_score"] > existing.c2_score:
+                                    existing.c2_score = candidate["c2_score"]
+                                    existing.signals = candidate.get("signals", [])
+                            else:
+                                c2_row = C2CandidateModel(
+                                    ioc_id=candidate["ioc_id"],
+                                    snapshot_id=candidate.get("snapshot_id"),
+                                    c2_score=candidate["c2_score"],
+                                    signals=candidate.get("signals", []),
+                                )
+                                session.add(c2_row)
+                                session.flush()
+                    except Exception:
+                        logger.debug("C2 candidate already exists for ioc_id=%d", candidate["ioc_id"])
+                session.commit()
+
+        logger.info("Periodic C2 ranking complete: %d candidates", len(c2_result) if c2_result else 0)
+        return {"candidates_found": len(c2_result) if c2_result else 0}
+    except Exception:
+        logger.exception("Periodic C2 ranking failed")
+        return {"candidates_found": 0, "error": True}
+
+
+_c2_ranking_thread: Optional[_threading.Thread] = None
+
+
+def _c2_ranking_scheduler_loop() -> None:
+    """Daemon thread that periodically enqueues C2 ranking messages."""
+    _time.sleep(60)  # Initial delay to let pipeline warm up
+    while True:
+        try:
+            if config.USE_DRAMATIQ_PIPELINE:
+                actors = _get_actors()
+                actors["rank_c2_candidates_periodic"].send()
+            else:
+                run_periodic_c2_ranking()
+        except Exception:
+            logger.exception("C2 ranking scheduler error; will retry next interval")
+        _time.sleep(C2_RANKING_INTERVAL_S)
+
+
+def start_periodic_c2_ranking() -> None:
+    """Start the background C2 ranking scheduler (idempotent).
+
+    Call once at worker startup.  Runs hourly in a daemon thread.
+    """
+    global _c2_ranking_thread
+    if not config.C2_DETECTION_ENABLED:
+        logger.info("C2 detection disabled; skipping periodic C2 ranking scheduler.")
+        return
+    if _c2_ranking_thread is not None and _c2_ranking_thread.is_alive():
+        logger.info("Periodic C2 ranking scheduler already running; skipping.")
+        return
+
+    _c2_ranking_thread = _threading.Thread(
+        target=_c2_ranking_scheduler_loop,
+        name="vigilwolf-c2-ranking-scheduler",
+        daemon=True,
+    )
+    _c2_ranking_thread.start()
+    logger.info("Started periodic C2 ranking scheduler (interval=%ds)", C2_RANKING_INTERVAL_S)
+
+
+# ---------------------------------------------------------------------------
+# Periodic actor profiling (hourly batch, not per-snapshot)
+# ---------------------------------------------------------------------------
+
+def run_periodic_actor_profiling() -> dict:
+    """Synchronous actor profiling runner — manages its own DB session.
+
+    Called by the Dramatiq actor and by the background scheduler thread.
+    Returns the profiling result dict for logging.
+    """
+    logger.info("Starting periodic actor profiling")
+    try:
+        from database import get_session  # type: ignore[import-untyped]
+        from services.actor_service import profile_actors  # type: ignore[import-untyped]
+
+        with get_session() as session:
+            actor_result = profile_actors(session)
+            session.commit()
+
+        logger.info("Periodic actor profiling complete: %s", actor_result)
+        return actor_result if actor_result else {"actors_created": 0, "actors_updated": 0}
+    except Exception:
+        logger.exception("Periodic actor profiling failed")
+        return {"actors_created": 0, "actors_updated": 0, "error": True}
+
+
+_actor_profiling_thread: Optional[_threading.Thread] = None
+
+
+def _actor_profiling_scheduler_loop() -> None:
+    """Daemon thread that periodically enqueues actor profiling messages."""
+    _time.sleep(120)  # Initial delay — actors need campaigns to exist first
+    while True:
+        try:
+            if config.USE_DRAMATIQ_PIPELINE:
+                actors = _get_actors()
+                actors["profile_actors_periodic"].send()
+            else:
+                run_periodic_actor_profiling()
+        except Exception:
+            logger.exception("Actor profiling scheduler error; will retry next interval")
+        _time.sleep(ACTOR_PROFILING_INTERVAL_S)
+
+
+def start_periodic_actor_profiling() -> None:
+    """Start the background actor profiling scheduler (idempotent).
+
+    Call once at worker startup.  Runs hourly in a daemon thread.
+    """
+    global _actor_profiling_thread
+    if not config.ACTOR_PROFILING_ENABLED:
+        logger.info("Actor profiling disabled; skipping periodic actor profiling scheduler.")
+        return
+    if _actor_profiling_thread is not None and _actor_profiling_thread.is_alive():
+        logger.info("Periodic actor profiling scheduler already running; skipping.")
+        return
+
+    _actor_profiling_thread = _threading.Thread(
+        target=_actor_profiling_scheduler_loop,
+        name="vigilwolf-actor-profiling-scheduler",
+        daemon=True,
+    )
+    _actor_profiling_thread.start()
+    logger.info("Started periodic actor profiling scheduler (interval=%ds)", ACTOR_PROFILING_INTERVAL_S)
 
 
 # ---------------------------------------------------------------------------
@@ -376,10 +574,6 @@ def capture_domain(domain_id: str, url: str, trigger_type: str = "nrd_ingest") -
         from sqlalchemy.exc import IntegrityError
 
         snapshot_id = str(uuid.uuid4())
-        snapshot_record_dict = {
-            "id": snapshot_id,
-            "domain_id": domain_id,
-        }
 
         # Duplicate check + insert in one session (prevents race condition
         # where a concurrent worker inserts the same snapshot between the check and
@@ -393,9 +587,32 @@ def capture_domain(domain_id: str, url: str, trigger_type: str = "nrd_ingest") -
             )
             if existing:
                 logger.info(
-                    "Duplicate snapshot for domain_id=%s sha256=%s; skipping.",
+                    "Duplicate snapshot for domain_id=%s sha256=%s; checking analysis.",
                     domain_id, sha256[:12],
                 )
+                # Re-trigger analysis if the existing snapshot has no risk score
+                from database import RiskScoreModel
+                has_score = (
+                    session.query(RiskScoreModel)
+                    .filter(RiskScoreModel.snapshot_id == existing.id)
+                    .first()
+                )
+                if not has_score:
+                    logger.info(
+                        "Duplicate snapshot %s has no risk score; re-triggering analysis.",
+                        existing.id,
+                    )
+                    if config.USE_DRAMATIQ_PIPELINE:
+                        actors = _get_actors()
+                        actors["build_context_and_analyze"].send(
+                            snapshot_id=existing.id,
+                            domain_id=domain_id,
+                        )
+                    else:
+                        build_context_and_analyze(
+                            snapshot_id=existing.id,
+                            domain_id=domain_id,
+                        )
                 return existing.id
 
             try:
@@ -421,9 +638,32 @@ def capture_domain(domain_id: str, url: str, trigger_type: str = "nrd_ingest") -
                 )
                 if existing:
                     logger.info(
-                        "Race condition: duplicate snapshot for domain_id=%s sha256=%s; returning existing.",
+                        "Race condition: duplicate snapshot for domain_id=%s sha256=%s; checking analysis.",
                         domain_id, sha256[:12],
                     )
+                    # Re-trigger analysis if the existing snapshot has no risk score
+                    from database import RiskScoreModel
+                    has_score = (
+                        session.query(RiskScoreModel)
+                        .filter(RiskScoreModel.snapshot_id == existing.id)
+                        .first()
+                    )
+                    if not has_score:
+                        logger.info(
+                            "Duplicate snapshot %s has no risk score; re-triggering analysis.",
+                            existing.id,
+                        )
+                        if config.USE_DRAMATIQ_PIPELINE:
+                            actors = _get_actors()
+                            actors["build_context_and_analyze"].send(
+                                snapshot_id=existing.id,
+                                domain_id=domain_id,
+                            )
+                        else:
+                            build_context_and_analyze(
+                                snapshot_id=existing.id,
+                                domain_id=domain_id,
+                            )
                     return existing.id
                 raise
 
@@ -457,17 +697,11 @@ def capture_domain(domain_id: str, url: str, trigger_type: str = "nrd_ingest") -
             actors["build_context_and_analyze"].send(
                 snapshot_id=snapshot_id,
                 domain_id=domain_id,
-                url=url,
-                html=html,
-                snapshot_record=snapshot_record_dict,
             )
         else:
             build_context_and_analyze(
                 snapshot_id=snapshot_id,
                 domain_id=domain_id,
-                url=url,
-                html=html,
-                snapshot_record=snapshot_record_dict,
             )
 
         return snapshot_id
@@ -484,11 +718,63 @@ def capture_domain(domain_id: str, url: str, trigger_type: str = "nrd_ingest") -
 def build_context_and_analyze(
     snapshot_id: str,
     domain_id: str,
-    url: str,
-    html: str,
-    snapshot_record: dict,
 ) -> None:
-    """Build a SnapshotContext and run the full analysis pipeline."""
+    """Build a SnapshotContext and run the full analysis pipeline.
+
+    Loads HTML from storage and the domain URL from the database so that
+    Dramatiq messages only need to carry ``snapshot_id`` and ``domain_id``
+    — never the (potentially large) HTML payload.
+    """
+    from database import get_session, SnapshotModel, DomainModel
+
+    # Look up the snapshot and domain to get the URL and html_path.
+    with get_session() as session:
+        snapshot = session.query(SnapshotModel).filter_by(id=snapshot_id).first()
+        if snapshot is None:
+            logger.error("Snapshot %s not found; aborting analysis.", snapshot_id)
+            return
+        domain_obj = session.query(DomainModel).filter_by(id=domain_id).first()
+        if domain_obj is None:
+            logger.error("Domain %s not found; aborting analysis for snapshot %s.", domain_id, snapshot_id)
+            return
+        url = domain_obj.url
+        snapshot_record = {"id": snapshot_id, "domain_id": domain_id}
+
+    # Load HTML from storage.
+    html = ""
+    html_load_failed = False
+    try:
+        from plugins.storage_manager import load_snapshot as _load_snapshot  # type: ignore[import-untyped]
+        loaded = _load_snapshot(domain_id=domain_id, snapshot_id=snapshot_id)
+        html = loaded.get("html", "") if loaded else ""
+    except ImportError:
+        logger.warning("storage_manager not available; cannot load HTML for snapshot %s", snapshot_id)
+        html_load_failed = True
+    except Exception:
+        logger.exception("Failed to load HTML from storage for snapshot %s", snapshot_id)
+        html_load_failed = True
+
+    if not html:
+        logger.error("No HTML available for snapshot_id=%s; aborting analysis.", snapshot_id)
+        # Mark all pending plugin statuses as "failed" so the pipeline
+        # doesn't appear stuck in "pending" indefinitely.
+        try:
+            from database import SnapshotPluginStatusModel, get_session
+            with get_session() as fail_session:
+                pending = (
+                    fail_session.query(SnapshotPluginStatusModel)
+                    .filter_by(snapshot_id=snapshot_id, status="pending")
+                    .all()
+                )
+                for row in pending:
+                    row.status = "failed"
+                    row.error_message = "HTML load failed — no content available for analysis"
+                    row.completed_at = datetime.now(timezone.utc)
+                fail_session.commit()
+        except Exception:
+            logger.exception("Failed to update plugin statuses for snapshot_id=%s", snapshot_id)
+        return
+
     # Extract domain from URL for the context
     parsed = urlparse(url)
     domain = parsed.netloc or url
@@ -582,6 +868,16 @@ def orchestrate_analysis(ctx: SnapshotContext) -> None:
                     if result.plugin_name == "whois_enricher" and result.findings:
                         if "registrar" in result.findings:
                             ctx.metadata["registrar"] = result.findings["registrar"]
+                            # Persist registrar to DomainModel
+                            try:
+                                from database import get_session as _gs, DomainModel as _DM  # type: ignore[import-untyped]
+                                with _gs() as reg_session:
+                                    domain_obj = reg_session.query(_DM).filter_by(id=ctx.snapshot_record.get("domain_id")).first()
+                                    if domain_obj is not None and not domain_obj.registrar:
+                                        domain_obj.registrar = result.findings["registrar"]
+                                        reg_session.commit()
+                            except Exception:
+                                logger.debug("Failed to persist registrar for domain_id=%s", ctx.snapshot_record.get("domain_id", "")[:8])
                         if "creation_date" in result.findings:
                             ctx.metadata["creation_date"] = result.findings["creation_date"]
                         # Also update snapshot_record for scoring modifiers
@@ -676,8 +972,7 @@ def orchestrate_analysis(ctx: SnapshotContext) -> None:
                         break
                 except Exception:
                     if attempt < max_retries - 1:
-                        import time
-                        time.sleep(2 ** attempt)  # 1s, 2s backoff
+                        _time.sleep(1 + attempt)  # 1s, 2s, 3s backoff
                         logger.warning("IOC persistence attempt %d failed for snapshot_id=%s; retrying", attempt + 1, ctx.snapshot_id)
                     else:
                         logger.exception("Failed to persist IOCs for snapshot_id=%s after %d attempts", ctx.snapshot_id, max_retries)
@@ -685,15 +980,27 @@ def orchestrate_analysis(ctx: SnapshotContext) -> None:
         # Increment Prometheus counter for domains processed
         _inc_domains_processed()
 
-        # Enqueue intelligence pipeline only if IOC data was persisted (or no IOC results to persist).
-        # Clustering and campaigns need IOC occurrences to produce meaningful results.
-        if ioc_persisted or not ioc_results:
-            if config.INTELLIGENCE_PIPELINE_ENABLED:
-                try:
-                    from intelligence_worker import enqueue_intelligence_pipeline
-                    enqueue_intelligence_pipeline(ctx.snapshot_id)
-                except Exception:
-                    logger.exception("Failed to enqueue intelligence pipeline for snapshot_id=%s", ctx.snapshot_id)
+        # Always enqueue the intelligence pipeline when enabled.
+        # Even if IOC persistence failed, clustering and phishkit detection
+        # can still run (they depend on html_hasher results, not IOC data).
+        # Campaign detection and actor profiling will produce partial results
+        # without IOC data, but this is better than skipping them entirely.
+        # A reconciliation pass can recover missed IOC data later.
+        if config.INTELLIGENCE_PIPELINE_ENABLED:
+            try:
+                from intelligence_worker import enqueue_intelligence_pipeline
+                enqueue_intelligence_pipeline(ctx.snapshot_id)
+            except Exception:
+                logger.exception("Failed to enqueue intelligence pipeline for snapshot_id=%s", ctx.snapshot_id)
+
+        # If IOC persistence failed but we have IOC results, log a warning
+        # so the reconciliation service can pick them up later.
+        if ioc_results and not ioc_persisted:
+            logger.warning(
+                "IOC persistence failed for snapshot_id=%s; intelligence pipeline enqueued without IOC data. "
+                "Reconciliation will attempt to recover.",
+                ctx.snapshot_id,
+            )
 
         # Record pipeline success/failure metric
         if scoring_failed:
