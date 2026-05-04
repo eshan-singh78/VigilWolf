@@ -125,6 +125,15 @@ _TRACKING_PIXEL_KEYWORDS = (
     "segment",
 )
 
+# Domains where exfil keywords appear legitimately (F-1).
+# These are real brand domains that use "post", "submit", etc. in their paths.
+_EXFIL_DOMAIN_DENYLIST = frozenset({
+    "postbank.com",
+    "deutsche-bank.de",
+    "poste.it",
+    "canadapost-postescanada.ca",
+})
+
 
 # ---------------------------------------------------------------------------
 # Role classification helpers
@@ -142,6 +151,11 @@ def _classify_url_role(url: str) -> str:
     parsed = urlparse(url)
     hostname = (parsed.hostname or "").lower()
     if any(hostname == domain or hostname.endswith("." + domain) for domain in _LEGITIMATE_LOGIN_DOMAINS):
+        return "resource"
+
+    # F-1: Check exfil domain denylist BEFORE keyword matching.
+    # These are legitimate brand domains that happen to use exfil keywords.
+    if any(hostname == d or hostname.endswith(f".{d}") for d in _EXFIL_DOMAIN_DENYLIST):
         return "resource"
 
     # Exfiltration endpoints: POST actions, form submissions
