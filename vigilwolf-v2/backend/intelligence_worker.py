@@ -56,13 +56,15 @@ def _record_stage_status(
                 existing.started_at = existing.started_at or datetime.now(timezone.utc)
                 existing.completed_at = datetime.now(timezone.utc)
             else:
+                # "queued" status should not have start/completion timestamps
+                ts = datetime.now(timezone.utc) if status != "queued" else None
                 row = IntelligencePipelineStatusModel(
                     snapshot_id=snapshot_id,
                     stage=stage,
                     status=status,
                     error_message=error_message,
-                    started_at=datetime.now(timezone.utc),
-                    completed_at=datetime.now(timezone.utc),
+                    started_at=ts,
+                    completed_at=ts,
                 )
                 session.add(row)
             session.commit()

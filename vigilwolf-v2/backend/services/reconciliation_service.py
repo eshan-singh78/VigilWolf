@@ -217,7 +217,7 @@ def reconcile_cluster_counts(session) -> dict:
     actual_counts = (
         session.query(
             ClusterMemberModel.cluster_id,
-            sa_func.count(ClusterMemberModel.domain_id),
+            sa_func.count(ClusterMemberModel.domain_id).label("count"),
         )
         .group_by(ClusterMemberModel.cluster_id)
         .subquery()
