@@ -15,6 +15,7 @@ from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
+from sqlalchemy import func
 from sqlalchemy.exc import IntegrityError
 
 logger = logging.getLogger(__name__)
@@ -27,11 +28,11 @@ WEIGHT_SHARED_INFRA = 0.3
 WEIGHT_SHARED_IOCS = 0.2
 WEIGHT_TEMPORAL = 0.2
 
-MAX_CAMPAIGNS_PER_PROFILE = 100
+MAX_CAMPAIGNS_PER_PROFILE = 50
 CAMPAIGN_WINDOW_DAYS = 30
 
 # Confidence thresholds
-CONFIDENCE_THRESHOLD = 0.6
+CONFIDENCE_THRESHOLD = 0.7
 LIKELY_SAME_THRESHOLD = 0.8
 INFRA_CONFIDENCE_THRESHOLD = 0.7
 MIN_INFRA_OVERLAP_COUNT = 3
@@ -112,19 +113,16 @@ def _compute_shared_kit(camp_a, camp_b, session) -> float:
 
 
 
-def _generate_label(confidence: float, fingerprint: dict) -> str:
-    """Generate a deterministic actor label from confidence and fingerprint.
+def _generate_label(confidence: float, camp_a_id: str, camp_b_id: str) -> str:
+    """Generate a deterministic actor label from campaign pair identity.
+
+    Uses the sorted pair of campaign ID prefixes to ensure the same
+    two campaigns always produce the same label, regardless of signal drift.
 
     >0.8: LIKELY_SAME_{hash8}
-    0.5-0.8: POSSIBLE_{hash8}
+    0.7-0.8: POSSIBLE_{hash8}
     """
-    shared = fingerprint.get("shared_signals", {})
-    raw = (
-        f"{shared.get('shared_kit', 0)}"
-        f"{shared.get('shared_infra', 0)}"
-        f"{shared.get('shared_iocs', 0)}"
-        f"{shared.get('temporal_overlap', 0)}"
-    )
+    raw = f"{sorted([camp_a_id, camp_b_id])[0]}:{sorted([camp_a_id, camp_b_id])[1]}"
     tag = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:8]
 
     if confidence > LIKELY_SAME_THRESHOLD:
@@ -395,21 +393,28 @@ def profile_actors(session) -> dict:
         for row in exfil_rows:
             exfil_ioc_map.setdefault(row.domain_id, []).append(row.value)
 
-    # Pre-load ALL existing actor-campaign mappings to avoid per-pair queries
+    # Pre-load actor-campaign mappings for relevant campaigns only
     actor_campaign_pairs: dict[frozenset[str], str] = {}  # {camp_id_a, camp_id_b} -> actor_id
-    all_actor_links = session.query(ActorCampaignModel).all()
+    all_actor_links = session.query(ActorCampaignModel).filter(
+        ActorCampaignModel.campaign_id.in_(campaign_ids)
+    ).all()
     actor_link_map: dict[str, list[str]] = {}  # actor_id -> [campaign_ids]
     for link in all_actor_links:
         actor_link_map.setdefault(link.actor_id, []).append(link.campaign_id)
 
+    # Only include pairs where both campaigns are in our active set
     for actor_id, camp_ids in actor_link_map.items():
-        for i in range(len(camp_ids)):
-            for j in range(i + 1, len(camp_ids)):
-                pair_key = frozenset([camp_ids[i], camp_ids[j]])
+        active_camp_ids = [cid for cid in camp_ids if cid in campaign_ids]
+        for i in range(len(active_camp_ids)):
+            for j in range(i + 1, len(active_camp_ids)):
+                pair_key = frozenset([active_camp_ids[i], active_camp_ids[j]])
                 actor_campaign_pairs[pair_key] = actor_id
 
-    # Pre-load all actors for updates
-    all_actors = {a.id: a for a in session.query(ActorModel).all()}
+    # Pre-load only actors linked to our campaigns
+    relevant_actor_ids = set(actor_link_map.keys())
+    all_actors = {a.id: a for a in session.query(ActorModel).filter(
+        ActorModel.id.in_(relevant_actor_ids)
+    ).all()} if relevant_actor_ids else {}
 
     actors_created = 0
     actors_updated = 0
@@ -461,7 +466,7 @@ def profile_actors(session) -> dict:
             domain_registrar_map, domain_asn_map, domain_snapshot_map,
             snapshot_ioc_map, exfil_ioc_map,
         )
-        label = _generate_label(confidence, fingerprint)
+        label = _generate_label(confidence, camp_a.id, camp_b.id)
 
         now = datetime.now(timezone.utc)
 
@@ -562,18 +567,74 @@ def profile_actors(session) -> dict:
                     actors_updated += 1
 
     session.flush()
+
+    # D-2: Merge pass — deduplicate actors that share the same campaign.
+    campaign_to_actors: dict[str, list[str]] = {}
+    all_actor_links = session.query(ActorCampaignModel).filter(
+        ActorCampaignModel.campaign_id.in_(campaign_ids)
+    ).all()
+    for link in all_actor_links:
+        campaign_to_actors.setdefault(link.campaign_id, []).append(link.actor_id)
+
+    actors_merged = 0
+    for campaign_id, actor_ids in campaign_to_actors.items():
+        if len(actor_ids) < 2:
+            continue
+
+        merge_actors = (
+            session.query(ActorModel)
+            .filter(ActorModel.id.in_(actor_ids))
+            .all()
+        )
+        if len(merge_actors) < 2:
+            continue
+
+        survivor = max(merge_actors, key=lambda a: a.confidence_score or 0.0)
+        non_survivors = [a for a in merge_actors if a.id != survivor.id]
+
+        for ns in non_survivors:
+            try:
+                with session.begin_nested():
+                    ns_links = session.query(ActorCampaignModel).filter(
+                        ActorCampaignModel.actor_id == ns.id
+                    ).all()
+                    for link in ns_links:
+                        existing = session.query(ActorCampaignModel).filter(
+                            ActorCampaignModel.actor_id == survivor.id,
+                            ActorCampaignModel.campaign_id == link.campaign_id,
+                        ).first()
+                        if existing is None:
+                            session.add(ActorCampaignModel(
+                                actor_id=survivor.id,
+                                campaign_id=link.campaign_id,
+                            ))
+                        session.delete(link)
+
+                    session.delete(ns)
+                    actors_merged += 1
+            except Exception:
+                logger.debug(
+                    "Actor merge failed for non-survivor %s into %s",
+                    ns.id[:8], survivor.id[:8],
+                )
+
+    if actors_merged:
+        logger.info("Merged %d duplicate actors into survivors", actors_merged)
+
     logger.info(
-        "profile_actors complete: %d actors created, %d actors updated",
-        actors_created, actors_updated,
+        "profile_actors complete: %d actors created, %d actors updated, %d actors merged",
+        actors_created, actors_updated, actors_merged,
     )
-    return {"actors_created": actors_created, "actors_updated": actors_updated}
+    return {"actors_created": actors_created, "actors_updated": actors_updated, "actors_merged": actors_merged}
 
 
-def get_actors(session) -> list[dict]:
-    """List all actors with confidence and campaign count.
+def get_actors(session, limit: int = 100, offset: int = 0) -> list[dict]:
+    """List actors with confidence and campaign count.
 
     Args:
         session: SQLAlchemy session.
+        limit: Maximum number of results to return.
+        offset: Number of results to skip.
 
     Returns:
         List of dicts, each with id, label, confidence_score, first_seen,
@@ -581,22 +642,27 @@ def get_actors(session) -> list[dict]:
     """
     from database import ActorCampaignModel, ActorModel  # type: ignore[import-untyped]
 
-    actors = session.query(ActorModel).order_by(ActorModel.confidence_score.desc()).all()
+    actors = session.query(ActorModel).order_by(ActorModel.confidence_score.desc()).offset(offset).limit(limit).all()
+
+    # Batch-load campaign counts for all actors in one query
+    actor_ids = [a.id for a in actors]
+    count_rows = (
+        session.query(ActorCampaignModel.actor_id, func.count(ActorCampaignModel.id))
+        .filter(ActorCampaignModel.actor_id.in_(actor_ids))
+        .group_by(ActorCampaignModel.actor_id)
+        .all()
+    ) if actor_ids else []
+    campaign_counts = dict(count_rows)
 
     results = []
     for actor in actors:
-        campaign_count = (
-            session.query(ActorCampaignModel)
-            .filter(ActorCampaignModel.actor_id == actor.id)
-            .count()
-        )
         results.append({
             "id": actor.id,
             "label": actor.label,
             "confidence_score": actor.confidence_score,
             "first_seen": actor.first_seen.isoformat() if actor.first_seen else None,
             "last_seen": actor.last_seen.isoformat() if actor.last_seen else None,
-            "campaign_count": campaign_count,
+            "campaign_count": campaign_counts.get(actor.id, 0),
         })
 
     logger.debug("get_actors: %d actors returned", len(results))
