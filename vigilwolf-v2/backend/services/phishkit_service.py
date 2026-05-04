@@ -17,9 +17,42 @@ from collections import defaultdict
 from datetime import datetime, timezone, timedelta
 from typing import Optional
 
+from sqlalchemy.exc import IntegrityError
+
 logger = logging.getLogger(__name__)
 
 PHISHKIT_WINDOW_DAYS = 30
+
+WATERMARK_PHISHKIT = "phishkit"
+
+
+def _get_watermark(watermark_id: str, session) -> Optional[datetime]:
+    """Read the last-processed timestamp for a phishkit detection pass."""
+    from database import ClusteringWatermarkModel
+    row = session.query(ClusteringWatermarkModel).get(watermark_id)
+    if row is None:
+        return None
+    return row.last_processed_at
+
+
+def _set_watermark(watermark_id: str, timestamp: datetime, session) -> None:
+    """Upsert the watermark for a phishkit detection pass.
+
+    Uses max() to ensure the watermark only advances forward,
+    preventing concurrent passes from going backwards.
+    """
+    from database import ClusteringWatermarkModel
+    row = session.query(ClusteringWatermarkModel).get(watermark_id)
+    if row is not None:
+        row.last_processed_at = max(row.last_processed_at, timestamp) if row.last_processed_at else timestamp
+        row.updated_at = datetime.now(timezone.utc)
+    else:
+        session.add(ClusteringWatermarkModel(
+            id=watermark_id,
+            last_processed_at=timestamp,
+            updated_at=datetime.now(timezone.utc),
+        ))
+    session.flush()
 
 
 # ---------------------------------------------------------------------------
@@ -56,36 +89,51 @@ def detect_phishkits(session) -> dict:
         SnapshotPhishkitModel,
     )
 
-    # -- Step 1: collect recent html_hasher results ------------------------------
+    # -- Step 1: collect recent html_hasher results (only needed columns) ------
     phishkit_cutoff = datetime.now(timezone.utc) - timedelta(days=PHISHKIT_WINDOW_DAYS)
 
-    # Only consider recent snapshots to avoid re-scanning the entire history.
-    recent_snapshot_ids = {
-        row.id
-        for row in session.query(SnapshotModel)
-        .filter(SnapshotModel.timestamp >= phishkit_cutoff)
-        .all()
-    }
+    # Incremental: only process snapshots since the last phishkit detection run.
+    watermark = _get_watermark(WATERMARK_PHISHKIT, session)
+    query_start = watermark if watermark and watermark > phishkit_cutoff else phishkit_cutoff
 
+    # Only consider recent snapshots to avoid re-scanning the entire history.
+    snapshot_rows = (
+        session.query(SnapshotModel.id, SnapshotModel.timestamp)
+        .filter(SnapshotModel.timestamp >= query_start)
+        .all()
+    )
+
+    if not snapshot_rows:
+        logger.debug("No new snapshots since watermark for phishkit detection; skipping.")
+        return {"phishkits_created": 0, "phishkits_updated": 0, "snapshots_linked": 0}
+
+    recent_snapshot_ids = {row_id for row_id, _ in snapshot_rows}
+    max_timestamp = max(ts for _, ts in snapshot_rows)
+
+    # Load html_hasher results via JOIN — avoids large IN clauses at scale.
     results = (
-        session.query(AnalysisResultModel)
+        session.query(
+            AnalysisResultModel.snapshot_id,
+            AnalysisResultModel.result_json,
+        )
+        .join(SnapshotModel, AnalysisResultModel.snapshot_id == SnapshotModel.id)
         .filter(
             AnalysisResultModel.plugin_name == "html_hasher",
-            AnalysisResultModel.snapshot_id.in_(recent_snapshot_ids),
+            SnapshotModel.timestamp >= query_start,
         )
         .all()
     )
 
     # -- Step 2: group snapshot_ids by structural_hash --------------------------
     hash_to_snapshots: dict[str, list[str]] = defaultdict(list)
-    for result in results:
-        findings = result.result_json or {}
+    for snapshot_id, result_json in results:
+        findings = result_json or {}
         structural_hash = findings.get("structural_hash")
         if not structural_hash:
             continue
         # Avoid recording the same snapshot twice for the same hash.
-        if result.snapshot_id not in hash_to_snapshots[structural_hash]:
-            hash_to_snapshots[structural_hash].append(result.snapshot_id)
+        if snapshot_id not in hash_to_snapshots[structural_hash]:
+            hash_to_snapshots[structural_hash].append(snapshot_id)
 
     phishkits_created = 0
     phishkits_updated = 0
@@ -98,11 +146,13 @@ def detect_phishkits(session) -> dict:
 
         # Resolve domain_ids for all snapshots in this group (needed later for
         # cluster membership and exfil enrichment).
-        snapshot_domain_map: dict[str, str] = {}
-        for sid in snapshot_ids:
-            snap = session.query(SnapshotModel).get(sid)
-            if snap is not None:
-                snapshot_domain_map[sid] = snap.domain_id
+        # Batch-load snapshot -> domain_id mapping
+        snap_rows = (
+            session.query(SnapshotModel.id, SnapshotModel.domain_id)
+            .filter(SnapshotModel.id.in_(snapshot_ids))
+            .all()
+        ) if snapshot_ids else []
+        snapshot_domain_map = {str(row[0]): row[1] for row in snap_rows}
 
         # -- Find or create PhishkitModel --------------------------------------
         phishkit = (
@@ -125,7 +175,7 @@ def detect_phishkits(session) -> dict:
                     session.flush()
                 phishkits_created += 1
                 logger.debug("Created phishkit %s (hash=%s)", phishkit.id, structural_hash[:12])
-            except Exception:
+            except IntegrityError:
                 # Concurrent insert — look up the phishkit that was just created
                 phishkit = (
                     session.query(PhishkitModel)
@@ -164,7 +214,7 @@ def detect_phishkits(session) -> dict:
                     session.add(link)
                     session.flush()
                 new_link_count += 1
-            except Exception:
+            except IntegrityError:
                 logger.debug(
                     "Snapshot-phishkit link already exists: snapshot=%s phishkit=%s",
                     sid[:8], phishkit.id[:8],
@@ -185,6 +235,10 @@ def detect_phishkits(session) -> dict:
         _upsert_phishkit_cluster(structural_hash, snapshot_domain_map, session)
 
     session.flush()
+
+    # Always advance the watermark when snapshots were processed to prevent
+    # reprocessing the same batch indefinitely.
+    _set_watermark(WATERMARK_PHISHKIT, max_timestamp, session)
 
     logger.info(
         "detect_phishkits: %d created, %d updated, %d snapshots linked",
@@ -300,7 +354,7 @@ def _upsert_phishkit_cluster(
                 session.add(cluster)
                 session.flush()
             logger.debug("Created phishkit cluster %s", cluster.id)
-        except Exception:
+        except IntegrityError:
             # Concurrent insert — look up the cluster that was just created
             cluster = (
                 session.query(ClusterModel)
@@ -340,7 +394,7 @@ def _upsert_phishkit_cluster(
                 session.add(member)
                 session.flush()
             added += 1
-        except Exception:
+        except IntegrityError:
             logger.debug(
                 "Cluster member already exists: cluster=%s domain=%s",
                 cluster.id[:8], domain_id[:8],

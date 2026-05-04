@@ -17,6 +17,43 @@ logger = logging.getLogger(__name__)
 
 CLUSTERING_WINDOW_DAYS = 30
 
+# Watermark IDs corresponding to each clustering pass.
+WATERMARK_STRUCTURAL_HASH = "structural_hash"
+WATERMARK_INFRA = "infra"
+
+
+def _get_watermark(watermark_id: str, session) -> Optional[datetime]:
+    """Read the last-processed timestamp for a clustering pass.
+
+    Returns None if no watermark exists (first run).
+    """
+    from database import ClusteringWatermarkModel  # type: ignore[import-untyped]
+    row = session.query(ClusteringWatermarkModel).get(watermark_id)
+    if row is None:
+        return None
+    return row.last_processed_at
+
+
+def _set_watermark(watermark_id: str, timestamp: datetime, session) -> None:
+    """Upsert the watermark for a clustering pass.
+
+    Uses max() to ensure the watermark only advances forward,
+    preventing concurrent passes from going backwards.
+    """
+    from database import ClusteringWatermarkModel  # type: ignore[import-untyped]
+    row = session.query(ClusteringWatermarkModel).get(watermark_id)
+    if row is not None:
+        # Only advance the watermark forward (C-3 race condition fix)
+        row.last_processed_at = max(row.last_processed_at, timestamp) if row.last_processed_at else timestamp
+        row.updated_at = datetime.now(timezone.utc)
+    else:
+        session.add(ClusteringWatermarkModel(
+            id=watermark_id,
+            last_processed_at=timestamp,
+            updated_at=datetime.now(timezone.utc),
+        ))
+    session.flush()
+
 
 # ---------------------------------------------------------------------------
 # Structural-hash clustering
@@ -25,9 +62,8 @@ CLUSTERING_WINDOW_DAYS = 30
 def cluster_by_structural_hash(session) -> dict:
     """Cluster domains that share the same HTML structural hash.
 
-    Queries all html_hasher analysis results, groups by structural_hash,
-    and creates ClusterModel + ClusterMemberModel rows for groups of 2+
-    domains sharing the same hash.
+    Uses an incremental watermark: only processes snapshots newer than the
+    last run, avoiding re-scanning the entire 30-day window each time.
 
     Args:
         session: SQLAlchemy session (caller is responsible for commit).
@@ -45,18 +81,32 @@ def cluster_by_structural_hash(session) -> dict:
     # Only consider recent snapshots to avoid re-scanning the entire history.
     clustering_cutoff = datetime.now(timezone.utc) - timedelta(days=CLUSTERING_WINDOW_DAYS)
 
-    recent_snapshot_ids = {
-        row.id
-        for row in session.query(SnapshotModel)
-        .filter(SnapshotModel.timestamp >= clustering_cutoff)
-        .all()
-    }
+    # Incremental: only process snapshots since the last clustering run.
+    watermark = _get_watermark(WATERMARK_STRUCTURAL_HASH, session)
+    query_start = watermark if watermark and watermark > clustering_cutoff else clustering_cutoff
 
+    snapshot_rows = (
+        session.query(SnapshotModel.id, SnapshotModel.domain_id, SnapshotModel.timestamp)
+        .filter(SnapshotModel.timestamp >= query_start)
+        .all()
+    )
+
+    if not snapshot_rows:
+        logger.debug("No new snapshots since watermark for structural_hash clustering; skipping.")
+        return {"clusters_created": 0, "domains_clustered": 0}
+
+    max_timestamp = max(ts for _, _, ts in snapshot_rows)
+
+    # Build snapshot->domain mapping from already-loaded data (no extra query).
+    snap_domain_map = {row_id: domain_id for row_id, domain_id, _ in snapshot_rows}
+
+    # Use JOIN instead of IN clause to avoid PostgreSQL parameter limits at scale.
     results = (
         session.query(AnalysisResultModel)
+        .join(SnapshotModel, AnalysisResultModel.snapshot_id == SnapshotModel.id)
         .filter(
             AnalysisResultModel.plugin_name == "html_hasher",
-            AnalysisResultModel.snapshot_id.in_(recent_snapshot_ids),
+            SnapshotModel.timestamp >= query_start,
         )
         .all()
     )
@@ -69,11 +119,9 @@ def cluster_by_structural_hash(session) -> dict:
         if not structural_hash:
             continue
 
-        # Resolve the domain_id through the snapshot.
-        snapshot = session.query(SnapshotModel).get(result.snapshot_id)
-        if snapshot is None:
+        domain_id = snap_domain_map.get(result.snapshot_id)
+        if domain_id is None:
             continue
-        domain_id = snapshot.domain_id
 
         # Avoid duplicate domain entries within the same hash group.
         if domain_id not in hash_groups[structural_hash]:
@@ -83,11 +131,11 @@ def cluster_by_structural_hash(session) -> dict:
     domains_clustered = 0
 
     for structural_hash, domain_ids in hash_groups.items():
-        if len(domain_ids) < 3:
-            continue
-
-        # Find or create the cluster.
-        cluster = (
+        # Check if a cluster already exists for this hash before applying
+        # the minimum-count threshold — new domains should always be added
+        # to an existing cluster, even if there are fewer than 3 in this
+        # watermark window.
+        existing_cluster = (
             session.query(ClusterModel)
             .filter(
                 ClusterModel.cluster_type == "html_similarity",
@@ -96,6 +144,12 @@ def cluster_by_structural_hash(session) -> dict:
             )
             .first()
         )
+
+        if existing_cluster is None and len(domain_ids) < 3:
+            continue
+
+        # Find or create the cluster.
+        cluster = existing_cluster
 
         if cluster is None:
             try:
@@ -166,7 +220,6 @@ def cluster_by_structural_hash(session) -> dict:
                     last_seen=datetime.now(timezone.utc),
                 )
             )
-            session.refresh(cluster, ["domain_count", "last_seen"])
             domains_clustered += added
             logger.debug(
                 "Cluster %s: added %d domains (total %d)",
@@ -174,6 +227,12 @@ def cluster_by_structural_hash(session) -> dict:
             )
 
     session.flush()
+
+    # Always advance the watermark when snapshots were processed, even if no
+    # new clusters were created. This prevents reprocessing the same batch
+    # indefinitely when all domains are already clustered.
+    _set_watermark(WATERMARK_STRUCTURAL_HASH, max_timestamp, session)
+
     logger.info(
         "Structural-hash clustering: %d clusters created, %d domains clustered",
         clusters_created, domains_clustered,
@@ -185,49 +244,18 @@ def cluster_by_structural_hash(session) -> dict:
 # Infrastructure clustering
 # ---------------------------------------------------------------------------
 
-def _build_infra_signature(domain_id: str, session) -> Optional[str]:
-    """Build an infrastructure signature tuple for a domain.
+def _build_infra_signature(
+    domain_id: str,
+    asn: Optional[str],
+    registrar: Optional[str],
+    first_ns: Optional[str],
+) -> Optional[str]:
+    """Build an infrastructure signature from pre-loaded data.
 
-    The signature is (asn, registrar, first NS record).  Returns None if
-    the domain has no IP records (cannot determine ASN).
+    Takes ASN, registrar, and first NS record instead of querying per-domain.
+    Returns None if fewer than 2 of 3 signal fields are present, or if the
+    only overlap is a common registrar.
     """
-    from database import (  # type: ignore[import-untyped]
-        DomainIpModel,
-        DnsRecordModel,
-        DomainModel,
-    )
-
-    domain = session.query(DomainModel).get(domain_id)
-    if domain is None:
-        return None
-
-    # ASN: take from the first IP record that has one.
-    asn = None
-    ip_record = (
-        session.query(DomainIpModel)
-        .filter(DomainIpModel.domain_id == domain_id)
-        .order_by(DomainIpModel.first_seen)
-        .first()
-    )
-    if ip_record and hasattr(ip_record, "asn") and ip_record.asn:
-        asn = str(ip_record.asn)
-
-    # Registrar: stored on DomainProcessingState or domain meta.
-    # Fallback: check if DomainModel has registrar attribute.
-    registrar = getattr(domain, "registrar", None)
-
-    # First NS record.
-    ns_record = (
-        session.query(DnsRecordModel)
-        .filter(
-            DnsRecordModel.domain_id == domain_id,
-            DnsRecordModel.type == "NS",
-        )
-        .order_by(DnsRecordModel.first_seen)
-        .first()
-    )
-    first_ns = ns_record.value if ns_record else None
-
     # Build signature. Require at least 2 of 3 signal fields to avoid grouping
     # unrelated domains that happen to share a blank field.
     signal_count = sum(1 for v in (asn, registrar, first_ns) if v is not None)
@@ -255,6 +283,9 @@ def _build_infra_signature(domain_id: str, session) -> Optional[str]:
 def cluster_by_infrastructure(session) -> dict:
     """Cluster domains that share the same infrastructure signature.
 
+    Uses an incremental watermark: only processes snapshots newer than the
+    last run, avoiding re-scanning the entire 30-day window each time.
+
     Infrastructure signature = (asn, registrar, first NS record).
     Domains with identical signatures are grouped into an infra cluster.
 
@@ -267,6 +298,8 @@ def cluster_by_infrastructure(session) -> dict:
     from database import (  # type: ignore[import-untyped]
         ClusterMemberModel,
         ClusterModel,
+        DnsRecordModel,
+        DomainIpModel,
         DomainModel,
         SnapshotModel,
     )
@@ -274,18 +307,81 @@ def cluster_by_infrastructure(session) -> dict:
     # Only consider domains that have been seen recently.
     clustering_cutoff = datetime.now(timezone.utc) - timedelta(days=CLUSTERING_WINDOW_DAYS)
 
-    recent_domain_ids = {
-        row.domain_id
-        for row in session.query(SnapshotModel)
-        .filter(SnapshotModel.timestamp >= clustering_cutoff)
-        .all()
-    }
+    # Incremental: only process snapshots since the last clustering run.
+    watermark = _get_watermark(WATERMARK_INFRA, session)
+    query_start = watermark if watermark and watermark > clustering_cutoff else clustering_cutoff
 
-    domains = session.query(DomainModel).filter(DomainModel.id.in_(recent_domain_ids)).all()
+    snapshot_rows = (
+        session.query(SnapshotModel.domain_id, SnapshotModel.timestamp)
+        .filter(SnapshotModel.timestamp >= query_start)
+        .all()
+    )
+
+    if not snapshot_rows:
+        logger.debug("No new snapshots since watermark for infra clustering; skipping.")
+        return {"clusters_created": 0, "domains_clustered": 0}
+
+    recent_domain_ids = {row_domain_id for row_domain_id, _ in snapshot_rows}
+    max_timestamp = max(ts for _, ts in snapshot_rows)
+
+    # Use JOIN-based subquery instead of IN clause for domain filtering.
+    domains = (
+        session.query(DomainModel)
+        .join(SnapshotModel, DomainModel.id == SnapshotModel.domain_id)
+        .filter(SnapshotModel.timestamp >= query_start)
+        .distinct()
+        .all()
+    )
+
+    # Batch-load ASN data: use the LATEST IP record with ASN per domain
+    # (not the first — domains that moved from CDN to phishing hosts should
+    # use the current ASN, not the CDN ASN, for accurate clustering)
+    # NOTE: IN clause is acceptable here because recent_domain_ids contains
+    # domain IDs (typically 10K-50K), not snapshot IDs (which can reach 300K+).
+    # Revisit with a JOIN if domain volume grows significantly.
+    domain_first_asn: dict[str, str | None] = {}
+    if recent_domain_ids:
+        ip_records = (
+            session.query(DomainIpModel)
+            .filter(DomainIpModel.domain_id.in_(recent_domain_ids))
+            .order_by(DomainIpModel.first_seen.desc())
+            .all()
+        )
+        for ip in ip_records:
+            if ip.domain_id not in domain_first_asn and hasattr(ip, "asn") and ip.asn:
+                domain_first_asn[ip.domain_id] = str(ip.asn)
+
+    # Batch-load first NS record per domain
+    # NOTE: IN clause is acceptable here (see ASN comment above for scale rationale).
+    domain_first_ns: dict[str, str | None] = {}
+    if recent_domain_ids:
+        ns_records = (
+            session.query(DnsRecordModel)
+            .filter(
+                DnsRecordModel.domain_id.in_(recent_domain_ids),
+                DnsRecordModel.type == "NS",
+            )
+            .order_by(DnsRecordModel.first_seen)
+            .all()
+        )
+        for ns in ns_records:
+            if ns.domain_id not in domain_first_ns:
+                domain_first_ns[ns.domain_id] = ns.value
+
+    # Pre-load registrar from domain objects
+    domain_registrar_map: dict[str, str | None] = {}
+    for domain in domains:
+        domain_registrar_map[domain.id] = getattr(domain, "registrar", None)
+
     sig_groups: dict[str, list[str]] = defaultdict(list)
 
     for domain in domains:
-        sig = _build_infra_signature(domain.id, session)
+        sig = _build_infra_signature(
+            domain.id,
+            asn=domain_first_asn.get(domain.id),
+            registrar=domain_registrar_map.get(domain.id),
+            first_ns=domain_first_ns.get(domain.id),
+        )
         if sig is None:
             continue
         sig_groups[sig].append(domain.id)
@@ -294,14 +390,12 @@ def cluster_by_infrastructure(session) -> dict:
     domains_clustered = 0
 
     for sig, domain_ids in sig_groups.items():
-        if len(domain_ids) < 3:
-            continue
-
         # Derive a stable hash from the signature string.
         sig_hash = hashlib.sha256(sig.encode("utf-8")).hexdigest()
 
-        # Find or create the cluster.
-        cluster = (
+        # Check if a cluster already exists before applying the minimum-count
+        # threshold — new domains should always be added to existing clusters.
+        existing_cluster = (
             session.query(ClusterModel)
             .filter(
                 ClusterModel.cluster_type == "infra",
@@ -310,6 +404,12 @@ def cluster_by_infrastructure(session) -> dict:
             )
             .first()
         )
+
+        if existing_cluster is None and len(domain_ids) < 3:
+            continue
+
+        # Find or create the cluster.
+        cluster = existing_cluster
 
         if cluster is None:
             try:
@@ -380,7 +480,6 @@ def cluster_by_infrastructure(session) -> dict:
                     last_seen=datetime.now(timezone.utc),
                 )
             )
-            session.refresh(cluster, ["domain_count", "last_seen"])
             domains_clustered += added
             logger.debug(
                 "Infra cluster %s: added %d domains (total %d)",
@@ -388,6 +487,12 @@ def cluster_by_infrastructure(session) -> dict:
             )
 
     session.flush()
+
+    # Always advance the watermark when snapshots were processed, even if no
+    # new clusters were created. This prevents reprocessing the same batch
+    # indefinitely when all domains are already clustered.
+    _set_watermark(WATERMARK_INFRA, max_timestamp, session)
+
     logger.info(
         "Infrastructure clustering: %d clusters created, %d domains clustered",
         clusters_created, domains_clustered,
