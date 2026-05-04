@@ -128,6 +128,13 @@ ACTOR_PROFILING_ENABLED = os.getenv("ACTOR_PROFILING_ENABLED", "false").lower() 
 C2_DETECTION_ENABLED = os.getenv("C2_DETECTION_ENABLED", "false").lower() == "true"
 
 # ---------------------------------------------------------------------------
+# v2 — Batch scheduler flags (C-2: per-snapshot → periodic batch)
+# ---------------------------------------------------------------------------
+BATCH_CLUSTERING_ENABLED = os.getenv("BATCH_CLUSTERING_ENABLED", "true").lower() == "true"
+BATCH_CAMPAIGN_ENABLED = os.getenv("BATCH_CAMPAIGN_ENABLED", "true").lower() == "true"
+BATCH_PHISHKIT_ENABLED = os.getenv("BATCH_PHISHKIT_ENABLED", "true").lower() == "true"
+
+# ---------------------------------------------------------------------------
 # v2 — Per-plugin feature flags
 # ---------------------------------------------------------------------------
 ENABLED_PLUGINS = os.getenv(
@@ -164,6 +171,19 @@ REDIS_RATE_LIMIT_DB = int(os.getenv("REDIS_RATE_LIMIT_DB", "2"))
 # v2 — Pipeline
 # ---------------------------------------------------------------------------
 PIPELINE_TIMEOUT_SECONDS = int(os.getenv("PIPELINE_TIMEOUT_SECONDS", "120"))
+
+# ---------------------------------------------------------------------------
+# v2 — Batch scheduler intervals (seconds)
+# ---------------------------------------------------------------------------
+BATCH_CLUSTERING_INTERVAL_S = int(os.getenv("BATCH_CLUSTERING_INTERVAL_S", "300"))
+BATCH_CAMPAIGN_INTERVAL_S = int(os.getenv("BATCH_CAMPAIGN_INTERVAL_S", "600"))
+BATCH_PHISHKIT_INTERVAL_S = int(os.getenv("BATCH_PHISHKIT_INTERVAL_S", "300"))
+
+# ---------------------------------------------------------------------------
+# v2 — Reconciliation batch limits (H-4: scale from hardcoded values)
+# ---------------------------------------------------------------------------
+RECONCILE_IOC_BATCH = int(os.getenv("RECONCILE_IOC_BATCH", "200"))
+RECONCILE_PIPELINE_BATCH = int(os.getenv("RECONCILE_PIPELINE_BATCH", "100"))
 
 
 def ensure_directories() -> None:
@@ -240,6 +260,9 @@ def get_config_summary() -> dict:
             "phishkit_detection_enabled": PHISHKIT_DETECTION_ENABLED,
             "actor_profiling_enabled": ACTOR_PROFILING_ENABLED,
             "c2_detection_enabled": C2_DETECTION_ENABLED,
+            "batch_clustering_enabled": BATCH_CLUSTERING_ENABLED,
+            "batch_campaign_enabled": BATCH_CAMPAIGN_ENABLED,
+            "batch_phishkit_enabled": BATCH_PHISHKIT_ENABLED,
         },
         "v2_risk": {
             "risk_threshold_high": RISK_THRESHOLD_HIGH,
@@ -251,5 +274,10 @@ def get_config_summary() -> dict:
             "redis_cache_db": REDIS_CACHE_DB,
             "redis_rate_limit_db": REDIS_RATE_LIMIT_DB,
             "pipeline_timeout_seconds": PIPELINE_TIMEOUT_SECONDS,
+            "batch_clustering_interval_s": BATCH_CLUSTERING_INTERVAL_S,
+            "batch_campaign_interval_s": BATCH_CAMPAIGN_INTERVAL_S,
+            "batch_phishkit_interval_s": BATCH_PHISHKIT_INTERVAL_S,
+            "reconcile_ioc_batch": RECONCILE_IOC_BATCH,
+            "reconcile_pipeline_batch": RECONCILE_PIPELINE_BATCH,
         },
     }
