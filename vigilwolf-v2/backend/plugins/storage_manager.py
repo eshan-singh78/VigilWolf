@@ -71,3 +71,40 @@ def save_snapshot(domain_id: str, snapshot_id: str, html: str) -> dict:
         raise
 
     return {"html_path": str(html_path), "assets_dir": str(root)}
+
+
+def load_snapshot(domain_id: str, snapshot_id: str) -> str:
+    """Load snapshot HTML from disk.
+
+    Reads the HTML file stored by ``save_snapshot`` and returns the content
+    as a string.  Raises ``FileNotFoundError`` if the HTML file does not exist,
+    or ``ValueError`` if domain_id or snapshot_id contain unsafe characters.
+
+    Args:
+        domain_id: The domain ID used when saving the snapshot.
+        snapshot_id: The snapshot ID used when saving the snapshot.
+
+    Returns:
+        The HTML content of the snapshot.
+    """
+    safe_domain = _sanitize_path_component(domain_id, "domain_id")
+    safe_snapshot = _sanitize_path_component(snapshot_id, "snapshot_id")
+
+    html_path = _SNAPSHOTS_BASE / safe_domain / safe_snapshot / "page.html"
+
+    # Defense in depth: verify the resolved path is within the base directory
+    try:
+        html_path.resolve().relative_to(_SNAPSHOTS_BASE.resolve())
+    except ValueError:
+        raise ValueError(
+            f"Path traversal detected: resolved path {html_path.resolve()} "
+            f"is outside snapshots directory {_SNAPSHOTS_BASE.resolve()}"
+        )
+
+    if not html_path.exists():
+        raise FileNotFoundError(
+            f"Snapshot HTML not found at {html_path} for "
+            f"domain_id={domain_id} snapshot_id={snapshot_id}"
+        )
+
+    return html_path.read_text(encoding="utf-8", errors="replace")
