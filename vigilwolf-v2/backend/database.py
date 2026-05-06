@@ -612,6 +612,15 @@ class C2CandidateModel(Base):
     ioc = relationship("IocModel")
 
 
+class ClusteringWatermarkModel(Base):
+    """Tracks the last-processed timestamp for incremental clustering."""
+    __tablename__ = "clustering_watermarks"
+
+    id = Column(String(50), primary_key=True)
+    last_processed_at = Column(DateTime, nullable=False)
+    updated_at = Column(DateTime, nullable=False)
+
+
 class IntelligencePipelineStatusModel(Base):
     """Per-snapshot, per-stage status for the intelligence pipeline."""
     __tablename__ = "intelligence_pipeline_status"

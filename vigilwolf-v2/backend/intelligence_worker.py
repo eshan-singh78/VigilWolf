@@ -99,21 +99,56 @@ def _record_stage_status(
         session.commit()
 
 
+_STALE_RUNNING_MINUTES = 30
+
+
 def _stage_already_done(snapshot_id: str, stage: str) -> bool:
     """Check if an intelligence pipeline stage has already completed for this snapshot.
 
     Returns True if a row exists with status ``done``, meaning the stage
-    should be skipped for idempotency.
+    should be skipped for idempotency.  Also returns True if a row is
+    stuck in ``running`` status for longer than ``_STALE_RUNNING_MINUTES``
+    (indicating a crashed worker), marking the row as failed so it can
+    be retried.
     """
     from database import get_session, IntelligencePipelineStatusModel  # type: ignore[import-untyped]
 
     with get_session() as session:
         existing = (
             session.query(IntelligencePipelineStatusModel)
-            .filter_by(snapshot_id=snapshot_id, stage=stage, status="done")
+            .filter_by(snapshot_id=snapshot_id, stage=stage)
             .first()
         )
-        return existing is not None
+        if existing is None:
+            return False
+
+        if existing.status == "done":
+            return True
+
+        if existing.status in ("running", "queued"):
+            # Check for staleness — if a stage has been running for too long,
+            # the worker likely crashed. Mark it as failed so it can be retried.
+            if existing.started_at is not None:
+                age = (datetime.now(timezone.utc) - existing.started_at.replace(tzinfo=timezone.utc) if existing.started_at.tzinfo is None else existing.started_at).total_seconds()
+                if age > _STALE_RUNNING_MINUTES * 60:
+                    logger.warning(
+                        "Stale %s status for snapshot_id=%s stage=%s (age=%.0fs); marking as failed",
+                        existing.status, snapshot_id, stage, age,
+                    )
+                    existing.status = "failed"
+                    existing.error_message = f"Stale {existing.status} status after {age:.0f}s"
+                    existing.completed_at = datetime.now(timezone.utc)
+                    session.commit()
+                    return False
+            # Still actively running — skip to avoid duplicate processing.
+            logger.info(
+                "Stage %s is %s for snapshot_id=%s; skipping.",
+                stage, existing.status, snapshot_id,
+            )
+            return True
+
+        # Status is "failed" — allow retry.
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -269,8 +304,21 @@ def run_intelligence_pipeline(snapshot_id: str) -> Optional[dict]:
                                         .first()
                                     )
                                     if existing:
-                                        # Update score if new score is higher
-                                        if candidate["c2_score"] > existing.c2_score:
+                                        # Apply time-based decay to existing score
+                                        # before comparing with the new score.
+                                        # Decay: halve the score for every 7 days of age.
+                                        if existing.last_seen:
+                                            age_days = (
+                                                datetime.now(timezone.utc)
+                                                - (existing.last_seen.replace(tzinfo=timezone.utc) if existing.last_seen.tzinfo is None else existing.last_seen)
+                                            ).total_seconds() / 86400
+                                            decay_factor = 0.5 ** (age_days / 7.0)
+                                            decayed_score = existing.c2_score * decay_factor
+                                        else:
+                                            decayed_score = existing.c2_score
+
+                                        # Update if new score exceeds decayed old score
+                                        if candidate["c2_score"] > decayed_score:
                                             existing.c2_score = candidate["c2_score"]
                                             existing.signals = candidate.get("signals", [])
                                             existing.snapshot_id = snapshot_id

@@ -69,20 +69,16 @@ def detect_phishkits(session) -> dict:
     # -- Step 1: collect recent html_hasher results ------------------------------
     phishkit_cutoff = datetime.now(timezone.utc) - timedelta(days=PHISHKIT_WINDOW_DAYS)
 
-    # Only consider recent snapshots to avoid re-scanning the entire history.
-    recent_snapshot_ids = {
-        row.id
-        for row in session.query(SnapshotModel)
-        .filter(SnapshotModel.timestamp >= phishkit_cutoff)
-        .all()
-    }
-
+    # Use yield_per for batched loading and filter by timestamp via join
+    # instead of loading all snapshot IDs into memory.
     results = (
         session.query(AnalysisResultModel)
+        .join(SnapshotModel, AnalysisResultModel.snapshot_id == SnapshotModel.id)
         .filter(
             AnalysisResultModel.plugin_name == "html_hasher",
-            AnalysisResultModel.snapshot_id.in_(recent_snapshot_ids),
+            SnapshotModel.timestamp >= phishkit_cutoff,
         )
+        .yield_per(500)
         .all()
     )
 
@@ -100,6 +96,22 @@ def detect_phishkits(session) -> dict:
     phishkits_created = 0
     phishkits_updated = 0
     snapshots_linked = 0
+
+    # Pre-load all ioc_extractor results for the relevant snapshots (P1-6).
+    # This avoids N+1 per-snapshot queries in _enrich_exfil_endpoint.
+    all_snapshot_ids_in_results = {r.snapshot_id for r in results}
+    ioc_results_map: dict[str, dict] = {}
+    if all_snapshot_ids_in_results:
+        ioc_rows = (
+            session.query(AnalysisResultModel)
+            .filter(
+                AnalysisResultModel.plugin_name == "ioc_extractor",
+                AnalysisResultModel.snapshot_id.in_(all_snapshot_ids_in_results),
+            )
+            .all()
+        )
+        for row in ioc_rows:
+            ioc_results_map[row.snapshot_id] = row.result_json or {}
 
     # -- Step 3: process each group ---------------------------------------------
     for structural_hash, snapshot_ids in hash_to_snapshots.items():
@@ -189,7 +201,7 @@ def detect_phishkits(session) -> dict:
 
         # -- Enrich exfil_endpoint from ioc_extractor --------------------------
         if phishkit.exfil_endpoint is None:
-            _enrich_exfil_endpoint(phishkit, snapshot_ids, session)
+            _enrich_exfil_endpoint(phishkit, snapshot_ids, session, ioc_results_map)
 
         # -- Create / update phishkit-type ClusterModel ------------------------
         _upsert_phishkit_cluster(structural_hash, snapshot_domain_map, session)
@@ -225,61 +237,57 @@ def _is_benign_domain(url_or_hostname: str) -> bool:
     return any(hostname == d or hostname.endswith(f".{d}") for d in _PHISHKIT_BENIGN_DOMAIN_DENYLIST)
 
 
-def _enrich_exfil_endpoint(phishkit, snapshot_ids: list[str], session) -> None:
+def _enrich_exfil_endpoint(phishkit, snapshot_ids: list[str], session, ioc_results_map: dict[str, dict] | None = None) -> None:
     """Look for exfiltration endpoint IOCs in ioc_extractor results.
 
-    Scans ioc_extractor analysis results for the given snapshots and sets
-    phishkit.exfil_endpoint to the first URL IOC whose role is exfil_endpoint.
-    Benign shared-infrastructure domains are skipped to avoid false enrichment.
+    Pre-loads all exfil_endpoint IOCs for the snapshot set in a single query,
+    then checks each snapshot.  Benign shared-infrastructure domains are
+    skipped to avoid false enrichment.  Accepts a pre-loaded ioc_results_map
+    to avoid N+1 per-snapshot queries.
     """
     from database import (  # type: ignore[import-untyped]
-        AnalysisResultModel,
         IocModel,
         IocOccurrenceModel,
     )
 
-    for sid in snapshot_ids:
-        ioc_result = (
-            session.query(AnalysisResultModel)
-            .filter(
-                AnalysisResultModel.snapshot_id == sid,
-                AnalysisResultModel.plugin_name == "ioc_extractor",
-            )
-            .first()
+    # Pre-load all exfil_endpoint IOCs for these snapshots in one query
+    exfil_rows = (
+        session.query(IocOccurrenceModel.snapshot_id, IocModel.value)
+        .join(IocModel, IocOccurrenceModel.ioc_id == IocModel.id)
+        .filter(
+            IocOccurrenceModel.snapshot_id.in_(snapshot_ids),
+            IocOccurrenceModel.role == "exfil_endpoint",
+            IocModel.type == "url",
         )
-        if ioc_result is None:
+        .all()
+    )
+    # Map snapshot_id -> list of exfil endpoint values
+    exfil_by_snapshot: dict[str, list[str]] = {}
+    for row in exfil_rows:
+        exfil_by_snapshot.setdefault(row.snapshot_id, []).append(row.value)
+
+    for sid in snapshot_ids:
+        # Check pre-loaded exfil_endpoint IOCs first
+        exfil_values = exfil_by_snapshot.get(sid, [])
+        for value in exfil_values:
+            if _is_benign_domain(value):
+                logger.debug(
+                    "Skipping benign exfil_endpoint=%s for phishkit %s (snapshot %s)",
+                    value, phishkit.id, sid,
+                )
+                continue
+            phishkit.exfil_endpoint = value
+            logger.debug(
+                "Enriched phishkit %s exfil_endpoint=%s from snapshot %s",
+                phishkit.id, value, sid,
+            )
+            return
+
+        # Fallback: inspect pre-loaded ioc_extractor findings JSON for form action URLs.
+        findings = (ioc_results_map or {}).get(sid)
+        if findings is None:
             continue
 
-        # Prefer explicit exfil_endpoint occurrences from the IOC pipeline.
-        exfil_occ = (
-            session.query(IocOccurrenceModel)
-            .join(IocModel, IocOccurrenceModel.ioc_id == IocModel.id)
-            .filter(
-                IocOccurrenceModel.snapshot_id == sid,
-                IocOccurrenceModel.role == "exfil_endpoint",
-                IocModel.type == "url",
-            )
-            .first()
-        )
-        if exfil_occ is not None:
-            ioc = session.query(IocModel).get(exfil_occ.ioc_id)
-            if ioc is not None:
-                # Skip benign shared-infrastructure domains.
-                if _is_benign_domain(ioc.value):
-                    logger.debug(
-                        "Skipping benign exfil_endpoint=%s for phishkit %s (snapshot %s)",
-                        ioc.value, phishkit.id, sid,
-                    )
-                    continue
-                phishkit.exfil_endpoint = ioc.value
-                logger.debug(
-                    "Enriched phishkit %s exfil_endpoint=%s from snapshot %s",
-                    phishkit.id, ioc.value, sid,
-                )
-                return
-
-        # Fallback: inspect ioc_extractor findings JSON for form action URLs.
-        findings = ioc_result.result_json or {}
         urls = findings.get("urls", [])
         for url in urls:
             url_lower = url.lower()

@@ -17,6 +17,10 @@ logger = logging.getLogger(__name__)
 
 CLUSTERING_WINDOW_DAYS = 30
 
+# Watermark keys for incremental processing
+_WATERMARK_STRUCTURAL_HASH = "structural_hash"
+_WATERMARK_INFRASTRUCTURE = "infrastructure"
+
 # Common ASNs that host massive shared infrastructure and should not be used
 # for infra clustering (they create false mega-clusters).
 _COMMON_ASN_DENYLIST = frozenset({
@@ -35,6 +39,42 @@ MAX_CLUSTER_SIZE = 500
 
 
 # ---------------------------------------------------------------------------
+# Watermark helpers
+# ---------------------------------------------------------------------------
+
+
+def _read_watermark(session, key: str) -> Optional[datetime]:
+    """Read the watermark for a clustering key. Returns None if no watermark exists."""
+    from database import ClusteringWatermarkModel  # type: ignore[import-untyped]
+
+    row = session.query(ClusteringWatermarkModel).filter(
+        ClusteringWatermarkModel.id == key
+    ).first()
+    if row is not None:
+        return row.last_processed_at.replace(tzinfo=timezone.utc) if row.last_processed_at.tzinfo is None else row.last_processed_at
+    return None
+
+
+def _write_watermark(session, key: str, timestamp: datetime) -> None:
+    """Write or update the watermark for a clustering key.
+
+    Uses session.merge() to atomically insert-or-update, eliminating the
+    race condition where concurrent workers could both query-for-absence and
+    then both try to insert.
+    """
+    from database import ClusteringWatermarkModel  # type: ignore[import-untyped]
+
+    now = datetime.now(timezone.utc)
+    row = ClusteringWatermarkModel(
+        id=key,
+        last_processed_at=timestamp,
+        updated_at=now,
+    )
+    session.merge(row)
+    session.flush()
+
+
+# ---------------------------------------------------------------------------
 # Structural-hash clustering
 # ---------------------------------------------------------------------------
 
@@ -44,6 +84,10 @@ def cluster_by_structural_hash(session) -> dict:
     Queries all html_hasher analysis results, groups by structural_hash,
     and creates ClusterModel + ClusterMemberModel rows for groups of 2+
     domains sharing the same hash.
+
+    Uses watermark-based incremental processing: on subsequent runs, only
+    snapshots newer than the watermark are processed. Falls back to full-scan
+    if no watermark exists (first run or after reset).
 
     Args:
         session: SQLAlchemy session (caller is responsible for commit).
@@ -61,10 +105,19 @@ def cluster_by_structural_hash(session) -> dict:
     # Only consider recent snapshots to avoid re-scanning the entire history.
     clustering_cutoff = datetime.now(timezone.utc) - timedelta(days=CLUSTERING_WINDOW_DAYS)
 
+    # Watermark: if set, only process snapshots newer than the watermark.
+    watermark = _read_watermark(session, _WATERMARK_STRUCTURAL_HASH)
+    effective_cutoff = max(clustering_cutoff, watermark) if watermark else clustering_cutoff
+    if watermark:
+        logger.info(
+            "Structural-hash clustering: watermark=%s, effective_cutoff=%s",
+            watermark.isoformat(), effective_cutoff.isoformat(),
+        )
+
     recent_snapshot_ids = {
         row.id
         for row in session.query(SnapshotModel)
-        .filter(SnapshotModel.timestamp >= clustering_cutoff)
+        .filter(SnapshotModel.timestamp >= effective_cutoff)
         .all()
     }
 
@@ -170,14 +223,19 @@ def cluster_by_structural_hash(session) -> dict:
                     cluster.id[:8], domain_id[:8],
                 )
 
-        # Update cluster metadata.
+        # Update cluster metadata with atomic domain_count.
         if added:
-            from sqlalchemy import update as sa_update
+            from sqlalchemy import func as sa_func, update as sa_update
+            actual_count = (
+                session.query(sa_func.count(ClusterMemberModel.id))
+                .filter(ClusterMemberModel.cluster_id == cluster.id)
+                .scalar()
+            ) or 0
             session.execute(
                 sa_update(ClusterModel)
                 .where(ClusterModel.id == cluster.id)
                 .values(
-                    domain_count=ClusterModel.domain_count + added,
+                    domain_count=actual_count,
                     last_seen=datetime.now(timezone.utc),
                 )
             )
@@ -189,6 +247,10 @@ def cluster_by_structural_hash(session) -> dict:
             )
 
     session.flush()
+
+    # Write watermark after successful processing.
+    _write_watermark(session, _WATERMARK_STRUCTURAL_HASH, datetime.now(timezone.utc))
+
     logger.info(
         "Structural-hash clustering: %d clusters created, %d domains clustered",
         clusters_created, domains_clustered,
@@ -291,10 +353,19 @@ def cluster_by_infrastructure(session) -> dict:
     # Only consider domains that have been seen recently.
     clustering_cutoff = datetime.now(timezone.utc) - timedelta(days=CLUSTERING_WINDOW_DAYS)
 
+    # Watermark: if set, only process snapshots newer than the watermark.
+    watermark = _read_watermark(session, _WATERMARK_INFRASTRUCTURE)
+    effective_cutoff = max(clustering_cutoff, watermark) if watermark else clustering_cutoff
+    if watermark:
+        logger.info(
+            "Infrastructure clustering: watermark=%s, effective_cutoff=%s",
+            watermark.isoformat(), effective_cutoff.isoformat(),
+        )
+
     recent_domain_ids = {
         row.domain_id
         for row in session.query(SnapshotModel)
-        .filter(SnapshotModel.timestamp >= clustering_cutoff)
+        .filter(SnapshotModel.timestamp >= effective_cutoff)
         .all()
     }
 
@@ -411,12 +482,17 @@ def cluster_by_infrastructure(session) -> dict:
                 )
 
         if added:
-            from sqlalchemy import update as sa_update
+            from sqlalchemy import func as sa_func, update as sa_update
+            actual_count = (
+                session.query(sa_func.count(ClusterMemberModel.id))
+                .filter(ClusterMemberModel.cluster_id == cluster.id)
+                .scalar()
+            ) or 0
             session.execute(
                 sa_update(ClusterModel)
                 .where(ClusterModel.id == cluster.id)
                 .values(
-                    domain_count=ClusterModel.domain_count + added,
+                    domain_count=actual_count,
                     last_seen=datetime.now(timezone.utc),
                 )
             )
@@ -428,6 +504,10 @@ def cluster_by_infrastructure(session) -> dict:
             )
 
     session.flush()
+
+    # Write watermark after successful processing.
+    _write_watermark(session, _WATERMARK_INFRASTRUCTURE, datetime.now(timezone.utc))
+
     logger.info(
         "Infrastructure clustering: %d clusters created, %d domains clustered",
         clusters_created, domains_clustered,
@@ -443,9 +523,9 @@ def cluster_by_infrastructure(session) -> dict:
 def reconcile_cluster_domain_counts(session) -> dict:
     """Reconcile ClusterModel.domain_count with actual ClusterMemberModel rows.
 
-    For each cluster, count the actual number of ClusterMemberModel rows and
-    update ClusterModel.domain_count if it doesn't match.  This corrects drift
-    caused by race conditions or failed transactions during clustering.
+    Uses a single GROUP BY query to count actual members per cluster, then
+    updates only the clusters where domain_count has drifted.  This corrects
+    drift caused by race conditions or failed transactions during clustering.
 
     Args:
         session: SQLAlchemy session (caller is responsible for commit).
@@ -459,6 +539,16 @@ def reconcile_cluster_domain_counts(session) -> dict:
     )
     from sqlalchemy import func
 
+    # Single GROUP BY query instead of N+1 per-cluster queries
+    actual_counts = dict(
+        session.query(
+            ClusterMemberModel.cluster_id,
+            func.count(ClusterMemberModel.id).label("count"),
+        )
+        .group_by(ClusterMemberModel.cluster_id)
+        .all()
+    )
+
     clusters = session.query(ClusterModel).all()
 
     clusters_checked = 0
@@ -466,11 +556,7 @@ def reconcile_cluster_domain_counts(session) -> dict:
 
     for cluster in clusters:
         clusters_checked += 1
-        actual_count = (
-            session.query(func.count(ClusterMemberModel.id))
-            .filter(ClusterMemberModel.cluster_id == cluster.id)
-            .scalar()
-        ) or 0
+        actual_count = actual_counts.get(cluster.id, 0)
 
         if cluster.domain_count != actual_count:
             logger.info(

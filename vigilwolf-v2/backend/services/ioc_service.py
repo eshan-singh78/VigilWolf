@@ -270,7 +270,9 @@ def persist_iocs(
     relationships_created = 0
 
     # Collect all IOC ids created/found in this run for same_page relationships.
+    # Also build ioc_id -> role map during persistence so we don't re-query.
     snapshot_ioc_ids: list[int] = []
+    ioc_role_map: dict[int, str] = {}
 
     for findings_key, ioc_type in _IOC_TYPE_MAP.items():
         raw_values = findings.get(findings_key) or []
@@ -336,6 +338,8 @@ def persist_iocs(
             # Create occurrence linking IOC to this snapshot (idempotent via unique constraint)
             role = _classify_role(ioc_type, normalized)
             context = _infer_context(ioc_type, normalized)
+            # Record role for priority-sorted same_page relationships (avoids re-query).
+            ioc_role_map[ioc_id] = role
 
             try:
                 with session.begin_nested():
@@ -362,14 +366,29 @@ def persist_iocs(
     # Build relationships -------------------------------------------------
 
     # same_page: pairwise between all IOCs found in this snapshot.
-    # Cap at MAX_SAME_PAGE_RELATIONSHIPS to prevent O(n^2) explosion.
+    # Sort by role priority before capping so exfil_endpoint and redirect
+    # relationships are preserved over less important ones.
+    _ROLE_PRIORITY = {"exfil_endpoint": 0, "redirect": 1, "cdn": 2, "tracking": 3, "resource": 4}
+
     if len(snapshot_ioc_ids) >= 2:
+        # ioc_role_map was built during persistence — no re-query needed.
         sorted_ids = sorted(set(snapshot_ioc_ids))
         pairs = [
             (sorted_ids[i], sorted_ids[j])
             for i in range(len(sorted_ids))
             for j in range(i + 1, len(sorted_ids))
         ]
+
+        # Sort pairs by the highest-priority role in the pair
+        def _pair_priority(pair):
+            min_prio = min(
+                _ROLE_PRIORITY.get(ioc_role_map.get(pair[0], "resource"), 4),
+                _ROLE_PRIORITY.get(ioc_role_map.get(pair[1], "resource"), 4),
+            )
+            return min_prio
+
+        pairs.sort(key=_pair_priority)
+
         # Cap total relationships per snapshot
         if len(pairs) > MAX_SAME_PAGE_RELATIONSHIPS:
             logger.info(

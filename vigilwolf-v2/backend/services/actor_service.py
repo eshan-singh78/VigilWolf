@@ -27,7 +27,9 @@ WEIGHT_SHARED_INFRA = 0.3
 WEIGHT_SHARED_IOCS = 0.2
 WEIGHT_TEMPORAL = 0.2
 
-MAX_CAMPAIGNS_PER_PROFILE = 100
+import config as _config
+
+MAX_CAMPAIGNS_PER_PROFILE = _config.ACTOR_MAX_CAMPAIGNS
 CAMPAIGN_WINDOW_DAYS = 30
 
 # Confidence thresholds
@@ -112,19 +114,17 @@ def _compute_shared_kit(camp_a, camp_b, session) -> float:
 
 
 
-def _generate_label(confidence: float, fingerprint: dict) -> str:
-    """Generate a deterministic actor label from confidence and fingerprint.
+def _generate_label(confidence: float, camp_a_id: str, camp_b_id: str) -> str:
+    """Generate a deterministic actor label from campaign pair IDs.
+
+    Uses sorted campaign IDs as hash input so the same campaign pair always
+    produces the same label regardless of signal drift.
 
     >0.8: LIKELY_SAME_{hash8}
     0.5-0.8: POSSIBLE_{hash8}
     """
-    shared = fingerprint.get("shared_signals", {})
-    raw = (
-        f"{shared.get('shared_kit', 0)}"
-        f"{shared.get('shared_infra', 0)}"
-        f"{shared.get('shared_iocs', 0)}"
-        f"{shared.get('temporal_overlap', 0)}"
-    )
+    ids = sorted([camp_a_id, camp_b_id])
+    raw = f"{ids[0]}{ids[1]}"
     tag = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:8]
 
     if confidence > LIKELY_SAME_THRESHOLD:
@@ -570,8 +570,26 @@ def profile_actors(session) -> dict:
     actors_created = 0
     actors_updated = 0
 
-    # Compare every unique pair of campaigns.
+    # Blocking strategy: only compare campaigns that share at least one
+    # cluster type. Campaigns with no shared clusters cannot share actors.
+    # Group campaigns by the set of cluster types they contain.
+    campaign_cluster_types: dict[str, set[str]] = {}
+    for camp in campaigns:
+        types: set[str] = set()
+        for cid in campaign_cluster_map.get(camp.id, set()):
+            ctype = cluster_type_map.get(cid)
+            if ctype:
+                types.add(ctype)
+        campaign_cluster_types[camp.id] = types
+
+    # Compare every unique pair of campaigns (with blocking).
     for camp_a, camp_b in itertools.combinations(campaigns, 2):
+        # Blocking: skip pairs with no shared cluster types
+        types_a = campaign_cluster_types.get(camp_a.id, set())
+        types_b = campaign_cluster_types.get(camp_b.id, set())
+        if not types_a.intersection(types_b):
+            continue
+
         sig_a = camp_a.kit_signature
         sig_b = camp_b.kit_signature
         shared_kit = 1.0 if (sig_a and sig_b and sig_a == sig_b) else 0.0
@@ -617,7 +635,7 @@ def profile_actors(session) -> dict:
             domain_registrar_map, domain_asn_map, domain_snapshot_map,
             snapshot_ioc_map, exfil_ioc_map,
         )
-        label = _generate_label(confidence, fingerprint)
+        label = _generate_label(confidence, camp_a.id, camp_b.id)
 
         now = datetime.now(timezone.utc)
 

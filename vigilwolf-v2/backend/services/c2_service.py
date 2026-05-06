@@ -42,7 +42,7 @@ C2_WINDOW_DAYS = 30
 
 # Maximum number of IOC candidates to load for C2 ranking.
 # Caps memory usage at scale by prioritizing most-recently-seen IOCs.
-MAX_C2_IOC_CANDIDATES = 5000
+MAX_C2_IOC_CANDIDATES = 2000
 
 
 # ---------------------------------------------------------------------------
@@ -53,14 +53,14 @@ MAX_C2_IOC_CANDIDATES = 5000
 def _is_post_form_target(ioc_value: str, ioc_type: str) -> bool:
     """Check if a URL IOC looks like a POST/form submission target.
 
-    Matches common phishing exfiltration URL patterns (login, submit, post,
-    api endpoints, form handlers).
+    Matches specific phishing exfiltration URL patterns. Generic terms like
+    "form" and "login" are excluded because they match almost every web page.
     """
     if ioc_type != "url":
         return False
     lower = ioc_value.lower()
     indicators = (
-        "submit", "login", "form", "upload",
+        "submit", "upload",
         "api/login", "api/submit", "capture", "exfil",
     )
     return any(sig in lower for sig in indicators)
@@ -233,9 +233,16 @@ def rank_c2_candidates(session, snapshot_id: str | None = None) -> list[dict]:
             signals.append("phishkit_linked")
 
         # Signal 4: Receives POST data / exfil_endpoint role (from bulk pre-load)
+        # If the IOC was already classified as exfil_endpoint by the IOC role
+        # classifier, it gets the full POST signal regardless of URL pattern.
         if ioc_roles.get(ioc.id) == "exfil_endpoint":
             score += SCORE_RECEIVES_POST
             signals.append("receives_post_data")
+            # Additional confirmation bonus: an exfil_endpoint IOC that also
+            # matches POST patterns is very likely C2.
+            if _is_post_form_target(ioc.value, ioc.type):
+                score += 0.1
+                signals.append("role_confirmed")
 
         # Filter out benign shared infrastructure domains
         hostname = (urlparse(ioc.value).hostname or "").lower() if ioc.type == "url" else ""

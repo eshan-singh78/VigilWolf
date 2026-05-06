@@ -165,6 +165,14 @@ REDIS_RATE_LIMIT_DB = int(os.getenv("REDIS_RATE_LIMIT_DB", "2"))
 # ---------------------------------------------------------------------------
 PIPELINE_TIMEOUT_SECONDS = int(os.getenv("PIPELINE_TIMEOUT_SECONDS", "120"))
 
+# ---------------------------------------------------------------------------
+# v2 — Thresholds (configurable for production tuning)
+# ---------------------------------------------------------------------------
+RECONCILE_ORPHAN_THRESHOLD_MINUTES = int(os.getenv("RECONCILE_ORPHAN_THRESHOLD_MINUTES", "15"))
+ACTOR_MAX_CAMPAIGNS = int(os.getenv("ACTOR_MAX_CAMPAIGNS", "200"))
+C2_MAX_CANDIDATES = int(os.getenv("C2_MAX_CANDIDATES", "2000"))
+EVENT_BUS_BUFFER_TTL = int(os.getenv("EVENT_BUS_BUFFER_TTL", "300"))
+
 
 def ensure_directories() -> None:
     """Create necessary directories if they don't exist."""
@@ -251,5 +259,9 @@ def get_config_summary() -> dict:
             "redis_cache_db": REDIS_CACHE_DB,
             "redis_rate_limit_db": REDIS_RATE_LIMIT_DB,
             "pipeline_timeout_seconds": PIPELINE_TIMEOUT_SECONDS,
+            "reconcile_orphan_threshold_minutes": RECONCILE_ORPHAN_THRESHOLD_MINUTES,
+            "actor_max_campaigns": ACTOR_MAX_CAMPAIGNS,
+            "c2_max_candidates": C2_MAX_CANDIDATES,
+            "event_bus_buffer_ttl": EVENT_BUS_BUFFER_TTL,
         },
     }

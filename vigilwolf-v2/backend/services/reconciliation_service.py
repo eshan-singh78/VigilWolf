@@ -9,10 +9,13 @@ from __future__ import annotations
 import logging
 from datetime import datetime, timezone, timedelta
 
+import config
+
 logger = logging.getLogger(__name__)
 
 # Plugins left in "running" status for longer than this are considered orphaned.
-ORPHANED_THRESHOLD_MINUTES = 5
+# Configurable via RECONCILE_ORPHAN_THRESHOLD_MINUTES env var.
+ORPHANED_THRESHOLD_MINUTES = config.RECONCILE_ORPHAN_THRESHOLD_MINUTES
 
 
 def reconcile_orphaned_statuses(session) -> dict:

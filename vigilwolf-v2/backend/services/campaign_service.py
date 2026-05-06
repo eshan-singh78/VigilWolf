@@ -9,7 +9,6 @@ alert and actor-profiling services.
 from __future__ import annotations
 
 import logging
-import re
 import uuid
 from datetime import datetime, timezone, timedelta
 from typing import Optional
@@ -169,33 +168,40 @@ def _detect_brand(domain_urls: list[str]) -> Optional[str]:
 
     combined = " ".join(hostnames)
 
-    # Collect ALL matching brands with scores.
+    # Collect ALL matching brands with scores using label-level matching.
+    # Label-level matching prevents false positives like "subchase.example.com"
+    # matching CHASE — only exact label or hyphen-delimited part matches count.
     brand_scores: dict[str, int] = {}
     for keyword, brand in BRAND_KEYWORDS:
         # Skip short keywords and denylisted terms to reduce false positives.
         if len(keyword) < _BRAND_MIN_LENGTH or keyword.lower() in _BRAND_DENYLIST:
             continue
-        # Match keyword as a word boundary within hostname parts.
-        # Hostnames use dots as separators, so match between dots/dashes.
-        pattern = rf"(?:^|[.-]){re.escape(keyword)}(?:[.-]|$)"
-        if re.search(pattern, combined):
-            score = 0
-            # Check each hostname for match quality
-            for h in hostnames:
-                sld = h.split(".")[-2] if len(h.split(".")) >= 2 else h
-                # Exact SLD match is the strongest signal
-                if keyword == sld:
-                    score += 3
+        # Match keyword against individual labels (dot-separated parts)
+        # of each hostname, and also hyphen-delimited parts within labels.
+        matched = False
+        for h in hostnames:
+            labels = h.split(".")
+            sld = labels[-2] if len(labels) >= 2 else h
+            for label in labels:
+                is_sld = (label == sld)
+                if keyword == label:
+                    # Exact full-label match — strongest signal
+                    matched = True
+                    if is_sld:
+                        brand_scores[brand] = max(brand_scores.get(brand, 0), 3)
+                    else:
+                        brand_scores[brand] = max(brand_scores.get(brand, 0), 1)
                 else:
-                    # Subdomain or partial match
-                    score += 1
+                    # Check hyphen-delimited parts within this label.
+                    # "chase-login" splits to ["chase", "login"] — "chase" matches.
+                    # "subchase" splits to ["subchase"] — "chase" does NOT match.
+                    parts = label.split("-")
+                    if keyword in parts:
+                        matched = True
+                        brand_scores[brand] = max(brand_scores.get(brand, 0), 1)
+        if matched and len(keyword) >= 6:
             # Longer keywords are more specific and deserve a bonus
-            if len(keyword) >= 6:
-                score += 1
-            if brand in brand_scores:
-                brand_scores[brand] = max(brand_scores[brand], score)
-            else:
-                brand_scores[brand] = score
+            brand_scores[brand] = brand_scores.get(brand, 0) + 1
 
     if not brand_scores:
         return None
@@ -227,71 +233,79 @@ def _generate_campaign_name(brand: str) -> str:
 # ---------------------------------------------------------------------------
 
 
-def _count_shared_iocs(campaign, cluster, session) -> int:
+def _count_shared_iocs(campaign, cluster, session, campaign_ioc_sets: dict | None = None) -> int:
     """Count IOCs shared between a campaign and a cluster using value-based comparison.
 
-    Compares (ioc_type, ioc_value) tuples rather than database IDs to avoid
-    false non-matches when the same IOC is stored under different rows.
+    Uses pre-loaded campaign IOC sets when available to avoid per-pair DB queries.
 
     Args:
         campaign: CampaignModel instance.
         cluster: ClusterModel instance.
         session: SQLAlchemy session.
+        campaign_ioc_sets: Optional pre-loaded dict of campaign_id -> IOC set.
 
     Returns:
         Number of shared (type, value) IOC pairs.
     """
     from database import (  # type: ignore[import-untyped]
-        CampaignClusterModel,
         ClusterMemberModel,
-        ClusterModel,
         IocModel,
         IocOccurrenceModel,
         SnapshotModel,
     )
 
-    def _load_ioc_set(entity_type: str, entity_id) -> set[tuple[str, str]]:
-        """Load IOC (type, value) tuples for a campaign or cluster."""
-        if entity_type == "campaign":
-            # Get all domain IDs from all clusters linked to the campaign.
-            domain_ids_q = (
-                session.query(ClusterMemberModel.domain_id)
-                .join(ClusterModel, ClusterMemberModel.cluster_id == ClusterModel.id)
-                .join(CampaignClusterModel, CampaignClusterModel.cluster_id == ClusterModel.id)
-                .filter(CampaignClusterModel.campaign_id == entity_id)
-            ).all()
-            domain_ids = {row[0] for row in domain_ids_q}
-        else:
-            # Get domain IDs from cluster members.
-            domain_ids_q = (
-                session.query(ClusterMemberModel.domain_id)
-                .filter(ClusterMemberModel.cluster_id == entity_id)
-            ).all()
-            domain_ids = {row[0] for row in domain_ids_q}
+    # Use pre-loaded campaign IOC set if available
+    if campaign_ioc_sets is not None and campaign.id in campaign_ioc_sets:
+        campaign_iocs = campaign_ioc_sets[campaign.id]
+    else:
+        # Fallback: load from DB (backward compatibility)
+        from database import CampaignClusterModel, ClusterModel  # type: ignore[import-untyped]
+        domain_ids_q = (
+            session.query(ClusterMemberModel.domain_id)
+            .join(ClusterModel, ClusterMemberModel.cluster_id == ClusterModel.id)
+            .join(CampaignClusterModel, CampaignClusterModel.cluster_id == ClusterModel.id)
+            .filter(CampaignClusterModel.campaign_id == campaign.id)
+        ).all()
+        domain_ids = {row[0] for row in domain_ids_q}
 
         if not domain_ids:
-            return set()
-
-        # Get snapshot IDs for these domains.
+            return 0
         snapshot_ids_q = (
             session.query(SnapshotModel.id)
             .filter(SnapshotModel.domain_id.in_(domain_ids))
         ).all()
         snapshot_ids = {row[0] for row in snapshot_ids_q}
-
         if not snapshot_ids:
-            return set()
-
-        # Get IOC (type, value) tuples from occurrences.
+            return 0
         rows = (
             session.query(IocModel.type, IocModel.value)
             .join(IocOccurrenceModel, IocOccurrenceModel.ioc_id == IocModel.id)
             .filter(IocOccurrenceModel.snapshot_id.in_(snapshot_ids))
         ).all()
-        return {(row[0], row[1]) for row in rows}
+        campaign_iocs = {(row[0], row[1]) for row in rows}
 
-    campaign_iocs = _load_ioc_set("campaign", campaign.id)
-    cluster_iocs = _load_ioc_set("cluster", cluster.id)
+    # Always load cluster IOCs from DB (they're the new cluster being evaluated)
+    cluster_domain_ids_q = (
+        session.query(ClusterMemberModel.domain_id)
+        .filter(ClusterMemberModel.cluster_id == cluster.id)
+    ).all()
+    cluster_domain_ids = {row[0] for row in cluster_domain_ids_q}
+    if not cluster_domain_ids:
+        return 0
+    cluster_snapshot_ids_q = (
+        session.query(SnapshotModel.id)
+        .filter(SnapshotModel.domain_id.in_(cluster_domain_ids))
+    ).all()
+    cluster_snapshot_ids = {row[0] for row in cluster_snapshot_ids_q}
+    if not cluster_snapshot_ids:
+        return 0
+    cluster_rows = (
+        session.query(IocModel.type, IocModel.value)
+        .join(IocOccurrenceModel, IocOccurrenceModel.ioc_id == IocModel.id)
+        .filter(IocOccurrenceModel.snapshot_id.in_(cluster_snapshot_ids))
+    ).all()
+    cluster_iocs = {(row[0], row[1]) for row in cluster_rows}
+
     return len(campaign_iocs & cluster_iocs)
 
 
@@ -353,12 +367,13 @@ def detect_campaigns(session) -> dict:
     cutoff = datetime.now(timezone.utc) - timedelta(days=DETECTION_WINDOW_DAYS)
     recheck_cutoff = datetime.now(timezone.utc) - timedelta(hours=CAMPAIGN_RECHECK_INTERVAL_HOURS)
 
-    # Find qualifying clusters: html_similarity, 3+ domains, within window,
-    # and not already checked within the recheck interval.
+    # Find qualifying clusters: html_similarity and phishkit, 3+ domains,
+    # within window, and not already checked within the recheck interval.
+    # Phishkit clusters indicate known phishing kit reuse — strong campaign signal.
     clusters = (
         session.query(ClusterModel)
         .filter(
-            ClusterModel.cluster_type == "html_similarity",
+            ClusterModel.cluster_type.in_(["html_similarity", "phishkit"]),
             ClusterModel.domain_count >= 3,
             ClusterModel.last_seen >= cutoff,
             or_(
@@ -372,7 +387,85 @@ def detect_campaigns(session) -> dict:
     campaigns_created = 0
     campaigns_updated = 0
 
+    # Pre-load IOC sets for all active campaigns to avoid per-pair DB queries (S-7).
+    active_campaign_ids = {c.id for c in session.query(CampaignModel).filter(
+        CampaignModel.status.in_(["active", "dormant"]),
+    ).all()} if clusters else set()
+
+    campaign_ioc_sets: dict[str, set[tuple[str, str]]] = {}
+    if active_campaign_ids:
+        # Bulk load all campaign -> cluster links
+        all_cc_links = session.query(CampaignClusterModel).filter(
+            CampaignClusterModel.campaign_id.in_(active_campaign_ids)
+        ).all()
+        campaign_cluster_ids_map: dict[str, set[str]] = {}
+        relevant_cluster_ids_for_ioc: set[str] = set()
+        for link in all_cc_links:
+            campaign_cluster_ids_map.setdefault(link.campaign_id, set()).add(link.cluster_id)
+            relevant_cluster_ids_for_ioc.add(link.cluster_id)
+
+        # Bulk load cluster -> domain mappings
+        cluster_domain_map_camp: dict[str, set[str]] = {}
+        if relevant_cluster_ids_for_ioc:
+            members = session.query(ClusterMemberModel).filter(
+                ClusterMemberModel.cluster_id.in_(relevant_cluster_ids_for_ioc)
+            ).all()
+            for m in members:
+                cluster_domain_map_camp.setdefault(m.cluster_id, set()).add(m.domain_id)
+
+        # Collect all relevant domain IDs
+        all_domain_ids_camp: set[str] = set()
+        for domain_ids in cluster_domain_map_camp.values():
+            all_domain_ids_camp.update(domain_ids)
+
+        # Bulk load domain -> snapshot mappings
+        domain_snapshot_map_camp: dict[str, set[str]] = {}
+        if all_domain_ids_camp:
+            snaps = session.query(SnapshotModel).filter(
+                SnapshotModel.domain_id.in_(all_domain_ids_camp)
+            ).all()
+            for s in snaps:
+                domain_snapshot_map_camp.setdefault(s.domain_id, set()).add(s.id)
+
+        # Collect all snapshot IDs
+        all_snapshot_ids_camp: set[str] = set()
+        for sids in domain_snapshot_map_camp.values():
+            all_snapshot_ids_camp.update(sids)
+
+        # Bulk load snapshot -> IOC (type, value) tuples using a subquery
+        # join instead of .in_() with a potentially huge ID set (P1-7).
+        if all_snapshot_ids_camp:
+            # Use a subquery on snapshot_id to avoid oversized IN clauses
+            snapshot_subq = (
+                session.query(SnapshotModel.id)
+                .filter(SnapshotModel.id.in_(all_snapshot_ids_camp))
+                .subquery()
+            )
+            ioc_rows = (
+                session.query(IocModel.type, IocModel.value, IocOccurrenceModel.snapshot_id)
+                .join(IocOccurrenceModel, IocOccurrenceModel.ioc_id == IocModel.id)
+                .join(snapshot_subq, snapshot_subq.c.id == IocOccurrenceModel.snapshot_id)
+                .all()
+            )
+            snapshot_ioc_map_camp: dict[str, set[tuple[str, str]]] = {}
+            for row in ioc_rows:
+                snapshot_ioc_map_camp.setdefault(row.snapshot_id, set()).add((row.type, row.value))
+
+            # Build campaign -> IOC set mapping
+            for camp_id, c_ids in campaign_cluster_ids_map.items():
+                ioc_set: set[tuple[str, str]] = set()
+                domain_ids_for_camp: set[str] = set()
+                for cid in c_ids:
+                    domain_ids_for_camp.update(cluster_domain_map_camp.get(cid, set()))
+                for did in domain_ids_for_camp:
+                    for sid in domain_snapshot_map_camp.get(did, set()):
+                        ioc_set.update(snapshot_ioc_map_camp.get(sid, set()))
+                campaign_ioc_sets[camp_id] = ioc_set
+
     for cluster in clusters:
+        # Track whether this cluster was actually processed
+        cluster_processed = False
+
         # Check if this cluster is already linked to a campaign.
         existing_link = (
             session.query(CampaignClusterModel)
@@ -420,6 +513,7 @@ def detect_campaigns(session) -> dict:
                 )
 
             campaigns_updated += 1
+            cluster_processed = True
             logger.debug(
                 "Updated campaign %s: domain_count=%d, last_seen=%s, status=%s",
                 campaign.id, campaign.domain_count,
@@ -469,7 +563,7 @@ def detect_campaigns(session) -> dict:
                         )
                 else:
                     # At least one side lacks a signature — require IOC overlap.
-                    shared_count = _count_shared_iocs(existing_brand_campaign, cluster, session)
+                    shared_count = _count_shared_iocs(existing_brand_campaign, cluster, session, campaign_ioc_sets=campaign_ioc_sets)
                     if shared_count >= 3:
                         should_merge = True
                     else:
@@ -511,11 +605,11 @@ def detect_campaigns(session) -> dict:
                             existing_brand_campaign.id[:8], existing_brand_campaign.name, brand,
                         )
                     campaigns_updated += 1
+                    cluster_processed = True
                     logger.debug(
                         "Linked cluster %s to existing campaign %s (brand=%s)",
                         cluster.id[:8], existing_brand_campaign.id[:8], brand,
                     )
-                    cluster.last_campaign_check = datetime.now(timezone.utc)
                     continue
                 # Not merging — fall through to create a new campaign.
 
@@ -548,6 +642,7 @@ def detect_campaigns(session) -> dict:
                 _recompute_domain_count(campaign, session)
 
                 campaigns_created += 1
+                cluster_processed = True
                 logger.info(
                     "Created campaign %s (%s): brand=%s, domain_count=%d",
                     campaign.id, campaign.name, brand, campaign.domain_count,
@@ -576,14 +671,16 @@ def detect_campaigns(session) -> dict:
                         session.flush()
                     _recompute_domain_count(campaign, session)
                     campaigns_updated += 1
+                    cluster_processed = True
                 except Exception:
                     logger.debug(
                         "Cluster %s already linked to campaign %s",
                         cluster.id[:8], campaign.id[:8],
                     )
 
-    for cluster in clusters:
-        cluster.last_campaign_check = datetime.now(timezone.utc)
+        # Only update last_campaign_check for clusters that were actually processed
+        if cluster_processed:
+            cluster.last_campaign_check = datetime.now(timezone.utc)
 
     session.flush()
     logger.info(

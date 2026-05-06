@@ -1,4 +1,4 @@
-"""VigilWolf v2 event bus with Redis pub/sub + in-memory fallback."""
+"""VigilWolf v2 event bus with Redis pub/sub + list buffer + in-memory fallback."""
 from __future__ import annotations
 
 import asyncio
@@ -11,9 +11,18 @@ import config
 
 logger = logging.getLogger(__name__)
 
+# Redis list buffer key prefix and TTL (seconds) for event persistence.
+_BUFFER_KEY_PREFIX = "vigilwolf:events:"
+_BUFFER_TTL = config.EVENT_BUS_BUFFER_TTL
+
 
 class EventBus:
-    """Redis-backed event bus with local in-memory fallback."""
+    """Redis-backed event bus with local in-memory fallback.
+
+    Events are published to both Redis pub/sub (for real-time delivery) and
+    a Redis list buffer (for recovery after brief disconnections). Subscribers
+    drain the list buffer first, then listen on pub/sub.
+    """
 
     CHANNEL = "vigilwolf.events"
 
@@ -47,14 +56,19 @@ class EventBus:
 
     # ------------------------------------------------------------------
     def publish(self, event_type: str, data: dict[str, Any]) -> None:
-        """Broadcast event to Redis channel and local subscribers."""
+        """Broadcast event to Redis channel, list buffer, and local subscribers."""
         payload: tuple[str, dict[str, Any]] = (event_type, data)
         if self._redis_enabled and self._redis is not None:
             try:
+                # Publish to pub/sub for real-time delivery
                 self._redis.publish(
                     self.CHANNEL,
                     json.dumps({"event_type": event_type, "data": data}),
                 )
+                # Also push to list buffer for recovery
+                buffer_key = f"{_BUFFER_KEY_PREFIX}{event_type}"
+                self._redis.rpush(buffer_key, json.dumps({"event_type": event_type, "data": data}))
+                self._redis.expire(buffer_key, _BUFFER_TTL)
             except Exception:
                 logger.exception("Failed to publish event to Redis")
 
@@ -96,11 +110,9 @@ class EventBus:
     ):
         """Yield event tuples from Redis (preferred) or local queue fallback.
 
-        When Redis is enabled, uses ``redis.asyncio`` so the event loop is
-        never blocked by a synchronous ``get_message`` call.  The local queue
-        is also drained on every iteration so that events published in-process
-        (which Redis pub/sub does not reflect back to the same subscriber) are
-        still delivered.
+        When Redis is enabled, subscribes to pub/sub FIRST (to close the
+        event-loss window), then drains the list buffer for recovery.  Events
+        received via pub/sub during the drain are deduplicated by the caller.
         """
         if self._redis_enabled and self._redis is not None:
             import redis.asyncio as aioredis
@@ -110,8 +122,34 @@ class EventBus:
                 db=config.REDIS_CACHE_DB,
                 decode_responses=True,
             )
+
+            # Subscribe to pub/sub FIRST — this closes the window where
+            # events published between drain and subscribe would be lost.
             pubsub = async_redis.pubsub()
             await pubsub.subscribe(self.CHANNEL)
+
+            # Drain list buffers — recover events that were published
+            # while this subscriber was disconnected.  Any events that
+            # arrive via pub/sub during this drain are also yielded
+            # (no harm — the caller deduplicates).
+            try:
+                for event_type_key in ["intelligence_pipeline", "alert", "webhook"]:
+                    buffer_key = f"{_BUFFER_KEY_PREFIX}{event_type_key}"
+                    while True:
+                        raw = await async_redis.lpop(buffer_key)
+                        if raw is None:
+                            break
+                        try:
+                            parsed = json.loads(raw)
+                            event_type = parsed.get("event_type")
+                            data = parsed.get("data")
+                            if isinstance(event_type, str) and isinstance(data, dict):
+                                yield event_type, data
+                        except Exception:
+                            logger.exception("Failed to parse buffered event payload")
+            except Exception:
+                logger.debug("Failed to drain event buffer (may be empty)")
+
             try:
                 while True:
                     # Drain any events published in-process first — Redis
